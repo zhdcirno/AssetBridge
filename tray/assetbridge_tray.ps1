@@ -1009,22 +1009,27 @@ function Find-Maya {
         'Program Files\Autodesk', 'Program Files (x86)\Autodesk', 'Autodesk',
         'DCC', 'DCC\Autodesk', 'Software\Autodesk', 'Apps\Autodesk'
     )
-    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
-        $driveRoot = $_.Root
-        foreach ($sub in $commonSubDirs) {
-            $p = Join-Path $driveRoot $sub
-            if (Test-Path -LiteralPath $p) { $candidateRoots.Add((Resolve-Path -LiteralPath $p).Path) }
+    try {
+        Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+            $driveRoot = $_.Root
+            foreach ($sub in $commonSubDirs) {
+                $p = Join-Path $driveRoot $sub
+                if (Test-Path -LiteralPath $p) { $candidateRoots.Add((Resolve-Path -LiteralPath $p).Path) }
+            }
+            foreach ($sub in @('Program Files\Autodesk\Maya*', 'Program Files (x86)\Autodesk\Maya*')) {
+                $p = Join-Path $driveRoot $sub
+                Resolve-Path -Path $p -ErrorAction SilentlyContinue | ForEach-Object { $candidateRoots.Add($_.Path) }
+            }
         }
-        foreach ($sub in @('Program Files\Autodesk\Maya*', 'Program Files (x86)\Autodesk\Maya*')) {
-            $p = Join-Path $driveRoot $sub
-            Resolve-Path -Path $p -ErrorAction SilentlyContinue | ForEach-Object { $candidateRoots.Add($_.Path) }
+        $candidateRoots = $candidateRoots | Select-Object -Unique
+        foreach ($root in $candidateRoots) {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+            Get-ChildItem -LiteralPath $root -Filter 'maya.exe' -Recurse -Depth $MaxDepth -File -ErrorAction SilentlyContinue |
+                ForEach-Object { Add-MayaCandidate $_.FullName "Scan:$root" }
         }
-    }
-    $candidateRoots = $candidateRoots | Select-Object -Unique
-    foreach ($root in $candidateRoots) {
-        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
-        Get-ChildItem -LiteralPath $root -Filter 'maya.exe' -Recurse -Depth $MaxDepth -File -ErrorAction SilentlyContinue |
-            ForEach-Object { Add-MayaCandidate $_.FullName "Scan:$root" }
+    } catch {
+        # 某个盘/路径触发终止性错误时，保留前面已找到的候选，不让整个 Maya 检测崩掉
+        Log ("安装器: Find-Maya 全盘扫描出错 -> " + $_.Exception.Message)
     }
 
     # ---- 映射为安装器统一对象（多版本 -> 多 targets，按 $MIN_MAYA 门槛过滤）----
@@ -1157,8 +1162,13 @@ function Find-Unreal {
 function Find-AllApps {
     $all = @()
     foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal')) {
-        $r = & $fn
-        if ($r) { $all += $r }
+        try {
+            $r = & $fn
+            if ($r) { $all += $r }
+        } catch {
+            # 单个检测器出错不该拖垮整个安装器：记日志 + 跳过该软件，其余照常展示
+            Log ("安装器: 检测 $fn 失败 -> " + $_.Exception.Message)
+        }
     }
     return $all
 }
@@ -1536,6 +1546,23 @@ if (-not $script:LastUp -and $script:Guard) {
 }
 $ni.Visible = $true
 $timer.Start()
+
+# 全局兜底：把 UI 线程上任何"未处理异常"从 JIT 崩溃对话框变成托盘内提示 + 写日志。
+# 没有这段，任一事件回调里的 cmdlet 出错（ErrorActionPreference=Stop 下尤其致命）
+# 都会弹出 ".NET 实时(JIT)调试" 崩溃框并直接杀死整个托盘进程。
+try {
+    [System.Windows.Forms.Application]::SetUnhandledExceptionMode('CatchException')
+    [System.Windows.Forms.Application]::add_ThreadException({
+        param($sender, $e)
+        try { Log ('未处理异常: ' + $e.Exception.ToString()) } catch { }
+        try {
+            [System.Windows.Forms.MessageBox]::Show(
+                ('操作时发生错误，托盘已保持运行（未退出）。' + "`n`n" + $e.Exception.Message +
+                 "`n`n详细信息已写入日志 tray.log"),
+                'AssetBridge', 'OK', 'Error') | Out-Null
+        } catch { }
+    })
+} catch { }
 
 [System.Windows.Forms.Application]::Run()
 
