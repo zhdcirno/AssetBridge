@@ -855,20 +855,184 @@ function Convert-MayaYear([string]$v) {
     return ''
 }
 function Find-Maya {
-    # 用户可能把 Maya 装在任意盘（本机在 G:\DCC\Maya2023\Maya2023\bin），
-    # 所以既扫 Autodesk 默认位置，也扫各盘 DCC 目录（限制深度递归）。
-    $roots = @('C:\Program Files\Autodesk') + $DCC_ROOTS
-    $exes = @(Find-ExeDeep $roots 'maya.exe' 3)
-    $exes += Find-ExeViaShortcut 'maya\.exe$'
+    [CmdletBinding()]
+    param(
+        [string[]]$ExtraRoots = @(),
+        [int]$MaxDepth = 3
+    )
 
+    # 增强版：从 PATH / 环境变量 / App Paths 注册表 / 卸载注册表 / Autodesk 注册表 /
+    # 文件关联 / 快捷方式 / 各盘常见目录 全维度探测 maya.exe，再把结果映射成安装器
+    # 需要的统一对象（多版本聚合 targets、按 $MIN_MAYA 门槛过滤）。
+    $cands = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+
+    function Add-MayaCandidate {
+        param(
+            [string]$Path,
+            [string]$Source
+        )
+        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+        $p = $Path.Trim()
+        $p = $p.Trim('"')
+        $p = $p -replace ',\d+$', ''      # DisplayIcon 常见 "...,0"
+        $p = $p -replace '\s+/.*$', ''    # 去掉命令行参数
+        $p = $p.Trim('"')
+        $exe = $null
+        # 情况 1：给的是目录。可能目录下直接有 maya.exe，也可能是安装根，bin\maya.exe
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            foreach ($t in @((Join-Path $p 'maya.exe'), (Join-Path $p 'bin\maya.exe'))) {
+                if (Test-Path -LiteralPath $t -PathType Leaf) { $exe = (Resolve-Path -LiteralPath $t).Path; break }
+            }
+        }
+        # 情况 2：给的就是 maya.exe
+        elseif (Test-Path -LiteralPath $p -PathType Leaf) {
+            if ([IO.Path]::GetFileName($p) -ieq 'maya.exe') { $exe = (Resolve-Path -LiteralPath $p).Path }
+        }
+        if (-not $exe) { return }
+        $full = [IO.Path]::GetFullPath($exe)
+        if (-not $seen.Add($full)) { return }
+        $ver = $null
+        try {
+            $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($full)
+            if ($vi.ProductVersion -match '\d{4}') { $ver = $Matches[0] }
+            elseif ($vi.FileVersion -match '\d{4}') { $ver = $Matches[0] }
+        } catch {}
+        if (-not $ver -and $full -match 'Maya[ _-]?(\d{4})') { $ver = $Matches[1] }
+        $cands.Add([pscustomobject]@{ VER=$ver; PATH=$full; SOURCE=$Source })
+    }
+
+    # 1. PATH / Get-Command / where
+    if ($env:Path) {
+        $env:Path -split ';' | Where-Object { $_ } | ForEach-Object { Add-MayaCandidate $_ 'PATH' }
+    }
+    Get-Command maya.exe -ErrorAction SilentlyContinue | ForEach-Object { Add-MayaCandidate $_.Source 'Get-Command' }
+    where.exe maya.exe 2>$null | ForEach-Object { Add-MayaCandidate $_ 'where.exe' }
+
+    # 2. 环境变量
+    if ($env:MAYA_LOCATION) { Add-MayaCandidate $env:MAYA_LOCATION 'ENV:MAYA_LOCATION' }
+    if ($env:DCC_ROOTS) { $env:DCC_ROOTS -split ';' | Where-Object { $_ } | ForEach-Object { Add-MayaCandidate $_ 'ENV:DCC_ROOTS' } }
+
+    # 3. App Paths 注册表
+    $appPathKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\maya.exe',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\maya.exe',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\maya.exe'
+    )
+    foreach ($k in $appPathKeys) {
+        if (Test-Path $k) {
+            $item = Get-Item -LiteralPath $k -ErrorAction SilentlyContinue
+            if ($item) {
+                Add-MayaCandidate $item.GetValue('') "AppPaths:$k"
+                Add-MayaCandidate $item.GetValue('Path') "AppPathsPath:$k"
+            }
+        }
+    }
+
+    # 4. 卸载注册表
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    Get-ItemProperty -Path $uninstallRoots -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match 'Autodesk Maya|^Maya\b' } |
+        ForEach-Object {
+            Add-MayaCandidate $_.InstallLocation "Uninstall:$($_.DisplayName)"
+            Add-MayaCandidate $_.DisplayIcon "UninstallIcon:$($_.DisplayName)"
+        }
+
+    # 5. Autodesk Maya 注册表
+    $autodeskBases = @(
+        'HKLM:\SOFTWARE\Autodesk\Maya',
+        'HKLM:\SOFTWARE\WOW6432Node\Autodesk\Maya',
+        'HKCU:\SOFTWARE\Autodesk\Maya'
+    )
+    foreach ($base in $autodeskBases) {
+        if (Test-Path $base) {
+            Get-ChildItem -Path $base -ErrorAction SilentlyContinue | ForEach-Object {
+                $item = Get-Item -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+                if ($item) {
+                    foreach ($name in @('', 'InstallPath', 'MAYA_INSTALL_LOCATION', 'InstallLocation', 'Path')) {
+                        Add-MayaCandidate $item.GetValue($name) "AutodeskReg:$($_.Name)"
+                    }
+                }
+            }
+        }
+    }
+
+    # 6. .ma / .mb 文件关联
+    $assocKeys = @(
+        'HKLM:\SOFTWARE\Classes\MayaSceneFile\shell\open\command',
+        'HKCU:\SOFTWARE\Classes\MayaSceneFile\shell\open\command',
+        'HKLM:\SOFTWARE\Classes\MayaBinaryFile\shell\open\command',
+        'HKCU:\SOFTWARE\Classes\MayaBinaryFile\shell\open\command'
+    )
+    foreach ($k in $assocKeys) {
+        if (Test-Path $k) {
+            $item = Get-Item -LiteralPath $k -ErrorAction SilentlyContinue
+            if ($item) {
+                $cmd = $item.GetValue('')
+                if ($cmd -match '"?([^"]*?maya\.exe)') { Add-MayaCandidate $Matches[1] "FileAssoc:$k" }
+            }
+        }
+    }
+
+    # 7. 快捷方式兜底（COM 不可用时跳过，不影响其它来源）
+    $wsh = $null
+    try { $wsh = New-Object -ComObject WScript.Shell } catch { $wsh = $null }
+    if ($wsh) {
+        $shortcutDirs = @(
+            [Environment]::GetFolderPath('StartMenu'),
+            [Environment]::GetFolderPath('CommonStartMenu'),
+            [Environment]::GetFolderPath('Desktop'),
+            [Environment]::GetFolderPath('CommonDesktopDirectory'),
+            "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+        ) | Where-Object { $_ -and (Test-Path $_) }
+        foreach ($dir in $shortcutDirs) {
+            Get-ChildItem -LiteralPath $dir -Filter *.lnk -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    try {
+                        $lnk = $wsh.CreateShortcut($_.FullName)
+                        Add-MayaCandidate $lnk.TargetPath "Shortcut:$($_.FullName)"
+                    } catch {}
+                }
+        }
+    }
+
+    # 8. 候选根扫描（含脚本常量 $DCC_ROOTS + ExtraRoots + 各盘常见子目录）
+    $candidateRoots = [System.Collections.Generic.List[string]]::new()
+    foreach ($r in ($DCC_ROOTS + $ExtraRoots)) { if ($r) { $candidateRoots.Add($r) } }
+    $commonSubDirs = @(
+        'Program Files\Autodesk', 'Program Files (x86)\Autodesk', 'Autodesk',
+        'DCC', 'DCC\Autodesk', 'Software\Autodesk', 'Apps\Autodesk'
+    )
+    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+        $driveRoot = $_.Root
+        foreach ($sub in $commonSubDirs) {
+            $p = Join-Path $driveRoot $sub
+            if (Test-Path -LiteralPath $p) { $candidateRoots.Add((Resolve-Path -LiteralPath $p).Path) }
+        }
+        foreach ($sub in @('Program Files\Autodesk\Maya*', 'Program Files (x86)\Autodesk\Maya*')) {
+            $p = Join-Path $driveRoot $sub
+            Resolve-Path -Path $p -ErrorAction SilentlyContinue | ForEach-Object { $candidateRoots.Add($_.Path) }
+        }
+    }
+    $candidateRoots = $candidateRoots | Select-Object -Unique
+    foreach ($root in $candidateRoots) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        Get-ChildItem -LiteralPath $root -Filter 'maya.exe' -Recurse -Depth $MaxDepth -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Add-MayaCandidate $_.FullName "Scan:$root" }
+    }
+
+    # ---- 映射为安装器统一对象（多版本 -> 多 targets，按 $MIN_MAYA 门槛过滤）----
     $good = @{}; $low = @()
-    foreach ($e in @($exes | Sort-Object -Unique)) {
-        $ver = ''
-        if ($e -match 'Maya[_ ]?(\d{4})') { $ver = $Matches[1] }          # 目录名带年份最可靠
-        if (-not $ver) { $ver = Convert-MayaYear (Get-ExeVer $e) }        # 否则用内部版本号反推
-        if (-not $ver) { continue }
+    foreach ($c in $cands) {
+        $ver = if ($c.VER) { $c.VER } else { 'UNKNOWN' }
         if (-not (Ver-GE $ver $MIN_MAYA)) { $low += $ver; continue }
-        if (-not $good.ContainsKey($ver)) { $good[$ver] = $e }
+        if (-not $good.ContainsKey($ver)) { $good[$ver] = $c.PATH }
     }
     if ($good.Count -eq 0) {
         if ($low.Count -eq 0) { return $null }
