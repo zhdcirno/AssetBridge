@@ -636,6 +636,17 @@ $MIN_SP       = '10.0.1'
 $MIN_SP_BUILD = 3757
 $MIN_UE       = '5.8'
 
+# 本机把 DCC 都装在各自盘的 DCC 目录下（用户习惯），一并纳入自动检测范围
+$DCC_ROOTS = @('D:\DCC', 'G:\DCC', 'E:\DCC', 'C:\DCC')
+
+# 安装器支持的四类软件（k=key / n=报告里显示名 / s=按钮短名 / src=本仓库插件源相对路径）
+$AB_APPS_META = @(
+    @{ k='blender'; n='Blender';           s='Blender'; src='plugins/blender/asset_bridge_blender' },
+    @{ k='maya';    n='Maya';              s='Maya';    src='plugins/maya/asset_bridge_maya' },
+    @{ k='sp';      n='Substance Painter'; s='SP';      src='plugins/substance_painter/asset-bridge' },
+    @{ k='ue';      n='Unreal Engine';     s='UE';      src='plugins/unreal/AssetBridge' }
+)
+
 function Parse-Version([string]$s) {
     $out = @()
     foreach ($p in ($s -split '[.\-]')) {
@@ -676,111 +687,262 @@ function Get-ExeVer([string]$exe) {
     } catch { }
     return ''
 }
+function Get-ExeVerAll([string]$exe) {
+    # 同时返回 ProductVersion / FileVersion（SP 的 build 号藏在 FileVersion 第 4 段）
+    $r = @{ pv = ''; fv = '' }
+    try {
+        $vi = (Get-Item $exe -ErrorAction Stop).VersionInfo
+        $r.pv = [string]$vi.ProductVersion
+        $r.fv = [string]$vi.FileVersion
+    } catch { }
+    return $r
+}
+function Sort-VersionKeys($keys) {
+    # 按 "主版本.次版本" 数值排序（字符串排序会把 10.0 排到 5.0 前面）
+    return @($keys | Sort-Object {
+        $v = @(Parse-Version $_)
+        if ($v.Count -ge 2) { [int]$v[0] * 10000 + [int]$v[1] } else { [int]$v[0] * 10000 }
+    })
+}
+function Find-ExeDeep([string[]]$roots, [string]$leaf, [int]$depth = 3) {
+    # 在若干根目录下限制深度递归查找某个可执行文件（避免全盘扫描）
+    $out = @()
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($f in (Get-ChildItem $r -Recurse -Depth $depth -Filter $leaf -File -ErrorAction SilentlyContinue)) {
+            $out += $f.FullName
+        }
+    }
+    return @($out | Sort-Object -Unique)
+}
+function Find-ExeViaShortcut([string]$pattern) {
+    # 兜底：从桌面 / 开始菜单快捷方式里解析真实 exe 路径
+    $out = @()
+    foreach ($ld in @((Join-Path $env:USERPROFILE 'Desktop'),
+                      (Join-Path $env:PUBLIC 'Desktop'),
+                      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+        if (-not (Test-Path $ld)) { continue }
+        foreach ($l in (Get-ChildItem $ld -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
+            $t = Get-LnkTarget $l.FullName
+            if ($t -match $pattern -and (Test-Path $t)) { $out += $t }
+        }
+    }
+    return @($out | Sort-Object -Unique)
+}
+function Get-BackupDir([string]$tag) {
+    $d = Join-Path (Join-Path $ROOT 'backups') ($tag + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    return $d
+}
+function Move-ToBackup([string]$path, [string]$bkDir) {
+    # 移动到备份目录；同名时自动加序号，绝不覆盖既有备份
+    $leaf = Split-Path $path -Leaf
+    $dest = Join-Path $bkDir $leaf
+    $i = 1
+    while (Test-Path $dest) { $dest = Join-Path $bkDir ($leaf + "_$i"); $i++ }
+    Move-Item $path $dest -Force
+    return $dest
+}
+function Get-PluginFingerprint([string]$dir) {
+    # 源目录内容指纹（相对路径+大小+修改时间），用于判断"已安装的是否还是最新源码"
+    if (-not $dir -or -not (Test-Path $dir)) { return '' }
+    try {
+        $items = Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\__pycache__\\' -and $_.Name -ne '.assetbridge.json' } |
+                 Sort-Object FullName
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($f in $items) {
+            $rel = $f.FullName.Substring($dir.Length).Replace('\', '/')
+            [void]$sb.Append($rel).Append('|').Append($f.Length).Append('|').Append($f.LastWriteTimeUtc.Ticks).Append("`n")
+        }
+        $sha = [System.Security.Cryptography.SHA1]::Create()
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString()))
+        return ([System.BitConverter]::ToString($hash) -replace '-', '').Substring(0, 16)
+    } catch { return '' }
+}
+function Write-Marker([string]$dst, $app) {
+    # 装完后在目标目录里留一张"安装卡片"，之后就能判断 已安装 / 可更新
+    try {
+        $m = [ordered]@{
+            tool        = 'AssetBridge'
+            host        = $app.key
+            hostVersion = $app.version
+            installedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            source      = $(if ($script:InstallSource) { 'github' } else { 'local' })
+            fingerprint = (Get-PluginFingerprint (Get-AppSourceDir $app.src))
+        }
+        $json = $m | ConvertTo-Json
+        [System.IO.File]::WriteAllText((Join-Path $dst '.assetbridge.json'), $json,
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+function Get-InstallState($app) {
+    $st = @{ installed = $false; latest = $false; text = '未安装' }
+    if (-not $app -or -not $app.targets -or @($app.targets).Count -eq 0) { return $st }
+    $exist = @($app.targets | Where-Object { Test-Path $_ })
+    if ($exist.Count -eq 0) { return $st }
+    $st.installed = $true
+    $srcFp = Get-PluginFingerprint (Get-AppSourceDir $app.src)
+    $coveredAll = ($exist.Count -eq @($app.targets).Count)
+    $hasMarker = $false; $fpMatch = $true
+    foreach ($t in $exist) {
+        $mf = Join-Path $t '.assetbridge.json'
+        if (Test-Path $mf) {
+            $hasMarker = $true
+            $fp = ''
+            try { $fp = [string]((Get-Content $mf -Raw -Encoding UTF8 | ConvertFrom-Json).fingerprint) } catch { }
+            if (-not $fp -or -not $srcFp -or $fp -ne $srcFp) { $fpMatch = $false }
+        } else {
+            $fpMatch = $false
+        }
+    }
+    if (-not $hasMarker)      { $st.text = '已安装（无版本记录）' }
+    elseif (-not $coveredAll) { $st.text = '已安装（部分版本缺失）' }
+    elseif ($fpMatch)         { $st.text = '已安装（最新）'; $st.latest = $true }
+    else                      { $st.text = '已安装（源已更新，可重装）' }
+    return $st
+}
 function Find-Blender {
     $exes = @()
-    foreach ($r in @('D:\DCC', 'C:\Program Files\Blender Foundation')) {
-        if (Test-Path $r) {
-            foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
-                $c = Join-Path $d.FullName 'blender.exe'
-                if (Test-Path $c) { $exes += $c }
-            }
-        }
-    }
-    foreach ($ld in @((Join-Path $env:USERPROFILE 'Desktop'),
-                      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-        if (Test-Path $ld) {
-            foreach ($l in (Get-ChildItem $ld -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
-                $t = Get-LnkTarget $l.FullName
-                if ($t -match 'blender\.exe$' -and (Test-Path $t)) { $exes += $t }
-            }
-        }
-    }
-    $found = @()
-    foreach ($e in ($exes | Sort-Object -Unique)) {
-        $ver = Get-ExeVer $e
-        if (-not $ver -and ($e -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
-        if (-not $ver) { continue }
-        if (-not (Ver-GE $ver $MIN_BLENDER)) { continue }
-        $mm = ($ver -split '\.')[0..1] -join '.'
-        $found += [PSCustomObject]@{
-            key='blender'; name='Blender'; version=$ver; path=$e; min=$MIN_BLENDER;
-            dst = "$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender";
-            src = 'plugins/blender/asset_bridge_blender'
-        }
-    }
-    return $found
-}
-function Find-Maya {
-    $exes = @()
-    $r = 'C:\Program Files\Autodesk'
-    if (Test-Path $r) {
-        foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
-            $c = Join-Path $d.FullName 'bin\maya.exe'
+    foreach ($r in ($DCC_ROOTS + @('C:\Program Files\Blender Foundation'))) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $d.FullName 'blender.exe'
             if (Test-Path $c) { $exes += $c }
         }
     }
-    $found = @()
-    foreach ($e in ($exes | Sort-Object -Unique)) {
-        $ver = ''
-        if ($e -match 'Maya(\d+)') { $ver = $Matches[1] }
+    $exes += Find-ExeViaShortcut 'blender\.exe$'
+
+    $good = @{}; $low = @()      # good: "主.次版本" -> exe；Blender 每个大版本目录独立，故按版本聚合
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $ver = Get-ExeVer $e
+        if (-not $ver -and ($e -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
         if (-not $ver) { continue }
-        if (-not (Ver-GE $ver $MIN_MAYA)) { continue }
-        $found += [PSCustomObject]@{
-            key='maya'; name='Maya'; version=$ver; path=$e; min=$MIN_MAYA;
-            dst = "$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya";
-            src = 'plugins/maya/asset_bridge_maya'
+        if (-not (Ver-GE $ver $MIN_BLENDER)) { $low += $ver; continue }
+        $mm = ($ver -split '\.')[0..1] -join '.'
+        if (-not $good.ContainsKey($mm)) { $good[$mm] = $e }
+    }
+    if ($good.Count -eq 0) {
+        if ($low.Count -eq 0) { return $null }
+        return [PSCustomObject]@{
+            key='blender'; name='Blender'; version=((Sort-VersionKeys ($low | Select-Object -Unique)) -join ',');
+            path=''; min=$MIN_BLENDER; src='plugins/blender/asset_bridge_blender';
+            targets=@(); ok=$false; note="检测到的 Blender 版本过低（需 >= $MIN_BLENDER），无法安装"
         }
     }
-    return $found
+    # ⚠️ 必须用 @() 包住：PowerShell 函数返回单元素数组会被"拆包"成标量，
+    # 那样 $keys[-1] 就变成取字符串最后一个字符（曾导致 path 变空）。
+    $keys = @(Sort-VersionKeys $good.Keys)
+    $targets = @()
+    foreach ($k in $keys) {
+        $targets += "$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$k\scripts\addons\asset_bridge_blender"
+    }
+    $note = ''
+    if ($low.Count -gt 0) {
+        $note = "另有低于 $MIN_BLENDER 的版本未安装：" + ((Sort-VersionKeys ($low | Select-Object -Unique)) -join ',')
+    }
+    return [PSCustomObject]@{
+        key='blender'; name='Blender'; version=($keys -join ','); path=$good[$keys[-1]]; min=$MIN_BLENDER;
+        src='plugins/blender/asset_bridge_blender'; targets=$targets; ok=$true; note=$note
+    }
+}
+function Convert-MayaYear([string]$v) {
+    # Maya 的 exe 版本是内部号（2023 -> 23.3.0.2072），没有年份；
+    # 2016 起内部主版本号 = 年份 - 2000，用它反推年份。
+    if (-not $v) { return '' }
+    $p = @(Parse-Version $v)
+    if ($p.Count -ge 1 -and $p[0] -ge 16 -and $p[0] -le 99) { return [string](2000 + [int]$p[0]) }
+    return ''
+}
+function Find-Maya {
+    # 用户可能把 Maya 装在任意盘（本机在 G:\DCC\Maya2023\Maya2023\bin），
+    # 所以既扫 Autodesk 默认位置，也扫各盘 DCC 目录（限制深度递归）。
+    $roots = @('C:\Program Files\Autodesk') + $DCC_ROOTS
+    $exes = @(Find-ExeDeep $roots 'maya.exe' 3)
+    $exes += Find-ExeViaShortcut 'maya\.exe$'
+
+    $good = @{}; $low = @()
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $ver = ''
+        if ($e -match 'Maya[_ ]?(\d{4})') { $ver = $Matches[1] }          # 目录名带年份最可靠
+        if (-not $ver) { $ver = Convert-MayaYear (Get-ExeVer $e) }        # 否则用内部版本号反推
+        if (-not $ver) { continue }
+        if (-not (Ver-GE $ver $MIN_MAYA)) { $low += $ver; continue }
+        if (-not $good.ContainsKey($ver)) { $good[$ver] = $e }
+    }
+    if ($good.Count -eq 0) {
+        if ($low.Count -eq 0) { return $null }
+        return [PSCustomObject]@{
+            key='maya'; name='Maya'; version=((Sort-VersionKeys ($low | Select-Object -Unique)) -join ',');
+            path=''; min=$MIN_MAYA; src='plugins/maya/asset_bridge_maya';
+            targets=@(); ok=$false; note="检测到的 Maya 版本过低（需 >= $MIN_MAYA），无法安装"
+        }
+    }
+    $keys = @(Sort-VersionKeys $good.Keys)
+    $targets = @()
+    foreach ($k in $keys) {
+        $targets += "$(Join-Path $env:USERPROFILE 'Documents')\maya\$k\zh_CN\scripts\asset_bridge_maya"
+    }
+    return [PSCustomObject]@{
+        key='maya'; name='Maya'; version=($keys -join ','); path=$good[$keys[-1]]; min=$MIN_MAYA;
+        src='plugins/maya/asset_bridge_maya'; targets=$targets; ok=$true; note=''
+    }
 }
 function Find-SubstancePainter {
     $exes = @()
-    foreach ($r in @('C:\Program Files\Adobe\Adobe Substance 3D Painter',
-                     'D:\DCC\Adobe Substance 3D Painter')) {
-        $c = Join-Path $r 'Adobe Substance 3D Painter.exe'
-        if (Test-Path $c) { $exes += $c }
-    }
-    foreach ($ld in @((Join-Path $env:USERPROFILE 'Desktop'),
-                      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-        if (Test-Path $ld) {
-            foreach ($l in (Get-ChildItem $ld -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
-                $t = Get-LnkTarget $l.FullName
-                if ($t -match 'Substance 3D Painter\.exe$' -and (Test-Path $t)) { $exes += $t }
-            }
+    # 1) 各盘 DCC 目录 / Adobe 默认目录下的 <子目录>\Adobe Substance 3D Painter.exe
+    foreach ($r in ($DCC_ROOTS + @('C:\Program Files\Adobe'))) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $d.FullName 'Adobe Substance 3D Painter.exe'
+            if (Test-Path $c) { $exes += $c }
         }
     }
+    # 2) Adobe 目录再深一层（有些版本装在 Adobe\<版本目录>\ 下）
+    $exes += @(Find-ExeDeep @('C:\Program Files\Adobe') 'Adobe Substance 3D Painter.exe' 2)
+    # 3) 快捷方式兜底
+    $exes += Find-ExeViaShortcut 'Substance 3D Painter\.exe$'
+
     $found = @()
-    foreach ($e in ($exes | Sort-Object -Unique)) {
-        $pv = ''; $build = 0
-        try {
-            $vi = (Get-Item $e -ErrorAction Stop).VersionInfo
-            $pv = $vi.ProductVersion
-            if ($vi.FileVersion -match '(\d+)$') { $build = [int]$Matches[1] }
-        } catch { }
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $vi = Get-ExeVerAll $e
+        $pv = $vi.pv
+        $build = 0
+        $parts = @($vi.fv -split '\.')
+        if ($parts.Count -ge 4) { [void][int]::TryParse($parts[3], [ref]$build) }   # build 只在 4 段版本里
+
         $ok = $false; $note = ''
-        if (-not $pv) { $note = '无法读取版本' }
+        if (-not $pv) { $note = '无法读取版本信息' }
         elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
-        elseif (($pv -eq $MIN_SP) -and ($build -lt $MIN_SP_BUILD)) { $note = "构建号过低（需 >= build $MIN_SP_BUILD）" }
-        else { $ok = $true }
+        elseif ($build -gt 0 -and $build -lt $MIN_SP_BUILD) { $note = "构建号过低（需 >= build $MIN_SP_BUILD，检测到 build $build）" }
+        else {
+            $ok = $true
+            # 注意：SP 的 exe 通常只写 3 段版本（如 10.0.1），build 号拿不到，
+            # 此时只校验到主版本，不再因为"读不到 build"就误判成过低。
+            if ($build -eq 0) { $note = "该安装未在程序里写构建号，按版本 $pv 判定（要求 >= $MIN_SP build $MIN_SP_BUILD）" }
+        }
+        $verText = $pv
+        if ($build -gt 0) { $verText = "$pv (build $build)" }
         $found += [PSCustomObject]@{
-            key='sp'; name='Substance Painter'; version=$pv; path=$e; min="$MIN_SP (build $MIN_SP_BUILD)";
-            dst = "$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge";
-            src = 'plugins/substance_painter/asset-bridge';
-            ok = $ok; note = $note
+            key='sp'; name='Substance Painter'; version=$verText; path=$e; min="$MIN_SP (build $MIN_SP_BUILD)";
+            src='plugins/substance_painter/asset-bridge';
+            targets=@("$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge");
+            ok=$ok; note=$note
         }
     }
-    return $found
+    if ($found.Count -eq 0) { return $null }
+    $best = @($found | Where-Object { $_.ok } | Select-Object -First 1)
+    if ($best.Count -eq 0) { $best = @($found | Select-Object -First 1) }
+    return $best[0]
 }
 function Find-Unreal {
-    $exes = @()
-    foreach ($r in @('G:\Engine', 'C:\Program Files\Epic Games')) {
-        if (Test-Path $r) {
-            foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
-                if ($d.Name -match '^UE[_ ]?(\d+\.\d+(?:\.\d+)?)') {
-                    $ed = Join-Path $d.FullName 'Engine\Binaries\Win64\UnrealEditor.exe'
-                    if (Test-Path $ed) { $exes += $ed }
-                }
-            }
+    $roots = @('G:\Engine', 'D:\Engine', 'E:\Engine', 'C:\Program Files\Epic Games', 'D:\Epic Games')
+    $engines = @()
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+            $ed = Join-Path $d.FullName 'Engine\Binaries\Win64\UnrealEditor.exe'
+            if (Test-Path $ed) { $engines += [PSCustomObject]@{ root = $d.FullName; exe = $ed } }
         }
     }
     try {
@@ -788,50 +950,94 @@ function Find-Unreal {
             $inst = (Get-ItemProperty $k.PSPath).InstalledDirectory
             if ($inst -and (Test-Path $inst)) {
                 $ed = Join-Path $inst 'Engine\Binaries\Win64\UnrealEditor.exe'
-                if (Test-Path $ed) { $exes += $ed }
+                if (Test-Path $ed) { $engines += [PSCustomObject]@{ root = $inst; exe = $ed } }
             }
         }
     } catch { }
-    $found = @()
-    foreach ($e in ($exes | Sort-Object -Unique)) {
+
+    $good = @{}; $low = @()
+    foreach ($g in $engines) {
         $ver = ''
-        if ($e -match 'UE[_ ]?(\d+\.\d+(?:\.\d+)?)') { $ver = $Matches[1] }
+        $bv = Join-Path $g.root 'Engine\Build\Build.version'      # 引擎自己写的版本文件最准
+        if (Test-Path $bv) {
+            try {
+                $j = Get-Content $bv -Raw -Encoding UTF8 | ConvertFrom-Json
+                $ver = "$($j.MajorVersion).$($j.MinorVersion)"
+            } catch { }
+        }
+        if (-not $ver -and ($g.root -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
         if (-not $ver) { continue }
-        $ok = (Ver-GE $ver $MIN_UE)
-        $found += [PSCustomObject]@{
-            key='ue'; name='Unreal Engine'; version=$ver; path=$e; min=$MIN_UE;
-            dst = (Join-Path (Split-Path (Split-Path $e) ) 'Plugins\AssetBridge');
-            src = 'plugins/unreal/AssetBridge';
-            ok = $ok; note = if ($ok) { '' } else { "版本过低（需 >= $MIN_UE）" }
+        if (-not (Ver-GE $ver $MIN_UE)) { $low += $ver; continue }
+        if (-not $good.ContainsKey($ver)) { $good[$ver] = $g }
+    }
+    if ($good.Count -eq 0) {
+        if ($low.Count -eq 0) { return $null }
+        return [PSCustomObject]@{
+            key='ue'; name='Unreal Engine'; version=((Sort-VersionKeys ($low | Select-Object -Unique)) -join ',');
+            path=''; min=$MIN_UE; src='plugins/unreal/AssetBridge';
+            targets=@(); ok=$false; note="检测到的 Unreal Engine 版本过低（需 >= $MIN_UE），无法安装"
         }
     }
-    return $found
+    $keys = @(Sort-VersionKeys $good.Keys)
+    $targets = @(); $paths = @()
+    foreach ($k in $keys) {
+        # 引擎级插件：<引擎根>\Engine\Plugins\AssetBridge（对该版本所有工程通用）
+        $targets += (Join-Path $good[$k].root 'Engine\Plugins\AssetBridge')
+        $paths   += $good[$k].exe
+    }
+    return [PSCustomObject]@{
+        key='ue'; name='Unreal Engine'; version=($keys -join ','); path=$paths[-1]; min=$MIN_UE;
+        src='plugins/unreal/AssetBridge'; targets=$targets; ok=$true; note=''
+    }
 }
 function Find-AllApps {
     $all = @()
-    $all += Find-Blender
-    $all += Find-Maya
-    $all += Find-SubstancePainter
-    $all += Find-Unreal
+    foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal')) {
+        $r = & $fn
+        if ($r) { $all += $r }
+    }
     return $all
 }
-function Copy-Plugin([string]$src, [string]$dst, [string]$label) {
+function Copy-Plugin([string]$src, [string]$dst, [string]$label, $app) {
     try {
         if (-not (Test-Path $src)) { return "源缺失: $src" }
         if (Test-Path $dst) {
-            $bk = $dst + '.bak_' + (Get-Date -Format 'yyyyMMddHHmmss')
-            Move-Item $dst $bk -Force
+            # 旧版本先移到 backups/ 里（绝不就地改名，避免被 DCC 当成插件扫描到）
+            $bk = Get-BackupDir ('install_' + $app.key)
+            Move-ToBackup $dst $bk | Out-Null
         }
         New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
         Copy-Item $src $dst -Recurse -Force
+        Get-ChildItem $dst -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue |
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        if ($app) { Write-Marker $dst $app }
         return "已安装 $label -> $dst"
     } catch { return "安装失败 $label : $_" }
 }
-function Install-App([PSCustomObject]$app) {
-    if (-not $app) { return '未检测到该软件' }
+function Install-App($app) {
+    if (-not $app) { return '未检测到该软件（请用下方「指定」按钮手动选择路径）' }
     if ($app.ok -eq $false) { return "无法安装：$($app.note)" }
+    $targets = @($app.targets)
+    if ($targets.Count -eq 0) { return '没有可用的安装目标，请重新检测' }
     $src = Get-AppSourceDir $app.src
-    $msg = Copy-Plugin $src $app.dst $app.name
+    if (-not (Test-Path $src)) { return "源缺失: $src" }
+    $msgs = @()
+    foreach ($dst in $targets) { $msgs += (Copy-Plugin $src $dst $app.name $app) }
+    $msg = ($msgs -join '  |  ')
+    Log ('安装器: ' + $msg)
+    return $msg
+}
+function Uninstall-App($app) {
+    if (-not $app) { return '未检测到该软件' }
+    $exist = @()
+    if ($app.targets) { $exist = @($app.targets | Where-Object { Test-Path $_ }) }
+    if ($exist.Count -eq 0) { return "未安装 $($app.name) 插件，无需卸载" }
+    $bk = Get-BackupDir ('uninstall_' + $app.key)
+    $n = 0
+    foreach ($t in $exist) {
+        try { Move-ToBackup $t $bk | Out-Null; $n++ } catch { }
+    }
+    $msg = "已卸载 $($app.name) 插件（$n 处），备份于 $bk"
     Log ('安装器: ' + $msg)
     return $msg
 }
@@ -875,8 +1081,8 @@ function Request-ManualPath([string]$key) {
                     $mm = ($ver -split '\.')[0..1] -join '.'
                     $app = [PSCustomObject]@{
                         key='blender'; name='Blender'; version=$ver; path=$exe; min=$MIN_BLENDER;
-                        dst = "$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender";
-                        src = 'plugins/blender/asset_bridge_blender'; ok=$true; note=''
+                        src = 'plugins/blender/asset_bridge_blender'; ok=$true; note='';
+                        targets = @("$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender")
                     }
                 } else {
                     [System.Windows.Forms.MessageBox]::Show("该 Blender 版本过低或无法识别（需 >= $MIN_BLENDER）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
@@ -890,13 +1096,13 @@ function Request-ManualPath([string]$key) {
             if ($ofd.ShowDialog() -eq 'OK') {
                 $exe = $ofd.FileName
                 $ver = ''
-                if ($exe -match 'Maya(\d+)') { $ver = $Matches[1] }
-                if (-not $ver) { $ver = Get-ExeVer $exe }
+                if ($exe -match 'Maya[_ ]?(\d{4})') { $ver = $Matches[1] }
+                if (-not $ver) { $ver = Convert-MayaYear (Get-ExeVer $exe) }
                 if ($ver -and (Ver-GE $ver $MIN_MAYA)) {
                     $app = [PSCustomObject]@{
                         key='maya'; name='Maya'; version=$ver; path=$exe; min=$MIN_MAYA;
-                        dst = "$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya";
-                        src = 'plugins/maya/asset_bridge_maya'; ok=$true; note=''
+                        src = 'plugins/maya/asset_bridge_maya'; ok=$true; note='';
+                        targets = @("$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya")
                     }
                 } else {
                     [System.Windows.Forms.MessageBox]::Show("该 Maya 版本过低或无法识别（需 >= $MIN_MAYA）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
@@ -909,22 +1115,25 @@ function Request-ManualPath([string]$key) {
             $ofd.Title  = '选择 Substance 3D Painter.exe'
             if ($ofd.ShowDialog() -eq 'OK') {
                 $exe = $ofd.FileName
-                $pv = ''; $build = 0
-                try {
-                    $vi = (Get-Item $exe -ErrorAction Stop).VersionInfo
-                    $pv = $vi.ProductVersion
-                    if ($vi.FileVersion -match '(\d+)$') { $build = [int]$Matches[1] }
-                } catch { }
+                $vi = Get-ExeVerAll $exe
+                $pv = $vi.pv; $build = 0
+                $parts = @($vi.fv -split '\.')
+                if ($parts.Count -ge 4) { [void][int]::TryParse($parts[3], [ref]$build) }
                 $ok = $false; $note = ''
-                if (-not $pv) { $note = '无法读取版本' }
+                if (-not $pv) { $note = '无法读取版本信息' }
                 elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
-                elseif (($pv -eq $MIN_SP) -and ($build -lt $MIN_SP_BUILD)) { $note = "构建号过低（需 >= build $MIN_SP_BUILD）" }
-                else { $ok = $true }
+                elseif ($build -gt 0 -and $build -lt $MIN_SP_BUILD) { $note = "构建号过低（需 >= build $MIN_SP_BUILD，检测到 build $build）" }
+                else {
+                    $ok = $true
+                    if ($build -eq 0) { $note = "该安装未在程序里写构建号，按版本 $pv 判定（要求 >= $MIN_SP build $MIN_SP_BUILD）" }
+                }
                 if ($ok) {
+                    $verText = $pv
+                    if ($build -gt 0) { $verText = "$pv (build $build)" }
                     $app = [PSCustomObject]@{
-                        key='sp'; name='Substance Painter'; version=$pv; path=$exe; min="$MIN_SP (build $MIN_SP_BUILD)";
-                        dst = "$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge";
-                        src = 'plugins/substance_painter/asset-bridge'; ok=$true; note=''
+                        key='sp'; name='Substance Painter'; version=$verText; path=$exe; min="$MIN_SP (build $MIN_SP_BUILD)";
+                        src = 'plugins/substance_painter/asset-bridge'; ok=$true; note=$note;
+                        targets = @("$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge")
                     }
                 } else {
                     [System.Windows.Forms.MessageBox]::Show("该 Substance Painter $note。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
@@ -953,8 +1162,8 @@ function Request-ManualPath([string]$key) {
                     if ($ver -and (Ver-GE $ver $MIN_UE)) {
                         $app = [PSCustomObject]@{
                             key='ue'; name='Unreal Engine'; version=$ver; path=$ed; min=$MIN_UE;
-                            dst = Join-Path $root 'Engine\Plugins\AssetBridge';
-                            src = 'plugins/unreal/AssetBridge'; ok=$true; note=''
+                            src = 'plugins/unreal/AssetBridge'; ok=$true; note='';
+                            targets = @(Join-Path $root 'Engine\Plugins\AssetBridge')
                         }
                     } else {
                         [System.Windows.Forms.MessageBox]::Show("该 Unreal Engine 版本过低或无法识别（需 >= $MIN_UE）。`n根目录: $root", '版本不符', 'OK', 'Warning') | Out-Null
@@ -966,45 +1175,87 @@ function Request-ManualPath([string]$key) {
     return $app
 }
 
+# ---- 安装器界面 ----
+# 控件引用放脚本作用域：.NET 事件回调是在消息循环里执行的，届时 Show-Installer 的
+# 局部变量早已不在作用域内。全部状态刷新交给脚本级函数 Update-InstallerUI。
+$script:IReport       = $null
+$script:IStatus       = $null
+$script:IInstallBtns  = @{}
+$script:IUninstallBtns = @{}
+$script:IApps         = @()
+
+function Update-InstallerUI {
+    $script:IApps = @(Find-AllApps)
+    $byKey = @{}
+    foreach ($a in $script:IApps) { $byKey[$a.key] = $a }
+    $lines = @()
+    foreach ($meta in $AB_APPS_META) {
+        $a  = $byKey[$meta.k]
+        $ib = $script:IInstallBtns[$meta.k]
+        $ub = $script:IUninstallBtns[$meta.k]
+        if (-not $a) {
+            $lines += ("{0,-18} 未检测到（可点下方『指定』按钮手动选择）" -f $meta.n)
+            if ($ib) { $ib.Enabled = $false; $ib.Text = '安装 ' + $meta.s }
+            if ($ub) { $ub.Enabled = $false }
+            $lines += ''
+            continue
+        }
+        $st   = Get-InstallState $a
+        $flag = if ($a.ok) { '✓ 可安装' } else { '✗ 不可安装' }
+        $lines += ("{0,-18} {1,-10} [{2}] {3}" -f $meta.n, ('v' + $a.version), $flag, $st.text)
+        if ($a.path) { $lines += ("   程序: " + $a.path) }
+        $lines += ("   最低要求 >= " + $a.min)
+        if ($a.note) { $lines += ("   注意: " + $a.note) }
+        foreach ($t in @($a.targets)) { $lines += ("   安装到: " + $t) }
+        if ($ib) {
+            $ib.Enabled = [bool]$a.ok
+            $ib.Text = $(if ($st.installed) { '更新 ' + $meta.s } else { '安装 ' + $meta.s })
+        }
+        if ($ub) { $ub.Enabled = [bool]$st.installed }
+        $lines += ''
+    }
+    if ($script:InstallSource) { $lines += ("安装源: " + $script:InstallSource) }
+    else { $lines += ('安装源: ' + $ROOT + '\plugins（本仓库）') }
+    if ($script:IReport) { $script:IReport.Text = [string]::Join([Environment]::NewLine, $lines) }
+}
+
 function Show-Installer {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Asset Bridge 插件安装器'
-    $form.ClientSize = New-Object System.Drawing.Size(560, 460)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 588)
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
 
     $report = New-Object System.Windows.Forms.TextBox
-    $report.SetBounds(14, 14, 532, 205)
+    $report.SetBounds(14, 14, 532, 300)
     $report.Multiline = $true; $report.ReadOnly = $true; $report.ScrollBars = 'Vertical'
     $report.Font = New-Object System.Drawing.Font('Consolas', 9)
     $form.Controls.Add($report)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.SetBounds(14, 226, 532, 20)
+    $status.SetBounds(14, 320, 532, 20)
     $form.Controls.Add($status)
 
     $bRefresh = New-Object System.Windows.Forms.Button
-    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 252, 100, 30)
+    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 344, 100, 30)
     $form.Controls.Add($bRefresh)
 
     $bDl = New-Object System.Windows.Forms.Button
-    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 252, 160, 30)
+    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 344, 160, 30)
     $form.Controls.Add($bDl)
 
-    $lbl1 = New-Object System.Windows.Forms.Label
-    $lbl1.Text = '一键安装（检测到且版本达标时可用）：'; $lbl1.SetBounds(14, 290, 532, 18)
-    $form.Controls.Add($lbl1)
-
     $bInstall = @{}
+    $bUninstall = @{}
+    $bManual = @{}
+
+    $lbl1 = New-Object System.Windows.Forms.Label
+    $lbl1.Text = '一键安装 / 更新（检测到且版本达标时可用）：'; $lbl1.SetBounds(14, 382, 532, 18)
+    $form.Controls.Add($lbl1)
     $xs = @(14, 150, 286, 422)
-    foreach ($meta in @(
-        @{k='blender'; t='安装 Blender'},
-        @{k='maya';    t='安装 Maya'},
-        @{k='sp';      t='安装 SP'},
-        @{k='ue';      t='安装 UE'})) {
+    foreach ($meta in $AB_APPS_META) {
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = $meta.t; $b.SetBounds($xs[0], 308, 132, 30); $xs[0] += 136
+        $b.Text = '安装 ' + $meta.s; $b.SetBounds($xs[0], 400, 132, 30); $xs[0] += 136
         $b.Enabled = $false
         $b.Tag = $meta.k
         $bInstall[$meta.k] = $b
@@ -1012,85 +1263,84 @@ function Show-Installer {
     }
 
     $lbl2 = New-Object System.Windows.Forms.Label
-    $lbl2.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl2.SetBounds(14, 346, 532, 18)
+    $lbl2.Text = '卸载插件（先备份到 backups/，可回滚）：'; $lbl2.SetBounds(14, 436, 532, 18)
     $form.Controls.Add($lbl2)
-
-    $bManual = @{}
     $xs = @(14, 150, 286, 422)
-    foreach ($meta in @(
-        @{k='blender'; t='指定 Blender'},
-        @{k='maya';    t='指定 Maya'},
-        @{k='sp';      t='指定 SP'},
-        @{k='ue';      t='指定 UE'})) {
+    foreach ($meta in $AB_APPS_META) {
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = $meta.t; $b.SetBounds($xs[0], 364, 132, 30); $xs[0] += 136
+        $b.Text = '卸载 ' + $meta.s; $b.SetBounds($xs[0], 454, 132, 30); $xs[0] += 136
+        $b.Enabled = $false
+        $b.Tag = $meta.k
+        $bUninstall[$meta.k] = $b
+        $form.Controls.Add($b)
+    }
+
+    $lbl3 = New-Object System.Windows.Forms.Label
+    $lbl3.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl3.SetBounds(14, 490, 532, 18)
+    $form.Controls.Add($lbl3)
+    $xs = @(14, 150, 286, 422)
+    foreach ($meta in $AB_APPS_META) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = '指定 ' + $meta.s; $b.SetBounds($xs[0], 508, 132, 30); $xs[0] += 136
         $b.Tag = $meta.k
         $bManual[$meta.k] = $b
         $form.Controls.Add($b)
     }
 
     $bClose = New-Object System.Windows.Forms.Button
-    $bClose.Text = '关闭'; $bClose.SetBounds(232, 408, 96, 30)
+    $bClose.Text = '关闭'; $bClose.SetBounds(232, 546, 96, 30)
     $bClose.add_Click({ $form.Close() })
     $form.Controls.Add($bClose)
 
-    $script:_apps = @()
-    function Update-Report {
-        $script:_apps = Find-AllApps
-        $lines = @()
-        $byKey = @{}
-        foreach ($a in $script:_apps) { $byKey[$a.key] = $a }
-        foreach ($meta in @(
-            @{k='blender'; n='Blender'},
-            @{k='maya';    n='Maya'},
-            @{k='sp';      n='Substance Painter'},
-            @{k='ue';      n='Unreal Engine'})) {
-            $a = $byKey[$meta.k]
-            if ($a) {
-                $st = if ($a.ok -eq $false) { '✗ 过低' } else { '✓ 可安装' }
-                $lines += ("{0,-18} {1,-10} 路径: {2}" -f $meta.n, ('v' + $a.version), $a.path)
-                $lines += ("   最低要求 >= {0}  [{1}]  -> {2}" -f $a.min, $st, $a.dst)
-                if ($a.note) { $lines += ("   注意: " + $a.note) }
-                if ($bInstall.ContainsKey($meta.k)) { $bInstall[$meta.k].Enabled = $a.ok }
-            } else {
-                $lines += ("{0,-18} 未检测到（可点下方『指定』按钮手动选择）" -f $meta.n)
-                if ($bInstall.ContainsKey($meta.k)) { $bInstall[$meta.k].Enabled = $false }
-            }
-            $lines += ''
-        }
-        if ($script:InstallSource) { $lines += ("当前安装源: $script:InstallSource") }
-        else { $lines += ("当前安装源: 本仓库 $ROOT/plugins") }
-        $report.Text = [string]::Join([Environment]::NewLine, $lines)
-    }
+    # 控件交给脚本作用域（事件回调触发时 Show-Installer 的局部变量已不可见）
+    $script:IReport        = $report
+    $script:IStatus        = $status
+    $script:IInstallBtns   = $bInstall
+    $script:IUninstallBtns = $bUninstall
 
-    $bRefresh.add_Click({ Update-Report; $status.Text = '已重新检测' })
-    $bDl.add_Click({
-        $status.Text = '正在从 GitHub 下载...'
-        $msg = Get-PluginSourceFromGitHub
-        $status.Text = $msg
-        Update-Report
+    $bRefresh.add_Click({
+        $script:IStatus.Text = '正在检测...'
+        $script:IStatus.Update()
+        Update-InstallerUI
+        $script:IStatus.Text = '已重新检测  ' + (Get-Date -Format 'HH:mm:ss')
     })
-    foreach ($k in @('blender','maya','sp','ue')) {
-        $bInstall[$k].add_Click({
-            param($sender,$e)
-            $key = $sender.Tag
-            $a = $script:_apps | Where-Object { $_.key -eq $key } | Select-Object -First 1
-            $status.Text = Install-App $a
-            Update-Report
+    $bDl.add_Click({
+        $script:IStatus.Text = '正在从 GitHub 下载...'
+        $script:IStatus.Update()
+        $script:IStatus.Text = (Get-PluginSourceFromGitHub)
+        Update-InstallerUI
+    })
+    foreach ($meta in $AB_APPS_META) {
+        $bInstall[$meta.k].add_Click({
+            param($sender, $e)
+            $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
+            if (-not $a) { $script:IStatus.Text = '未检测到该软件，请用「指定」按钮手动选择路径'; return }
+            $script:IStatus.Text = (Install-App $a)
+            Update-InstallerUI
         })
-        $bManual[$k].add_Click({
-            param($sender,$e)
-            $key = $sender.Tag
-            $app = Request-ManualPath $key
+        $bUninstall[$meta.k].add_Click({
+            param($sender, $e)
+            $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
+            if (-not $a) { return }
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                ("确定卸载 " + $a.name + " 的 Asset Bridge 插件吗？`n`n将从以下位置移除（会先备份到 backups/，可回滚）：`n" + (@($a.targets) -join "`n")),
+                '确认卸载', 'YesNo', 'Warning')
+            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            $script:IStatus.Text = (Uninstall-App $a)
+            Update-InstallerUI
+        })
+        $bManual[$meta.k].add_Click({
+            param($sender, $e)
+            $app = Request-ManualPath $sender.Tag
             if ($app) {
-                $status.Text = Install-App $app
-                Update-Report
+                $script:IStatus.Text = (Install-App $app)
+                Update-InstallerUI
             }
         })
     }
 
     Set-FormIcon $form
-    Update-Report
+    Update-InstallerUI
     [void]$form.ShowDialog()
 }
 
