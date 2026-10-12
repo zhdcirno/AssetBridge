@@ -625,8 +625,8 @@ function Show-Settings {
 # ===========================================================================
 #  插件安装器：自动识别本机 DCC 软件 + 版本校验 + 一键安装 + 从 GitHub 下载
 # ===========================================================================
-# 默认下载仓库（推送 GitHub 后把 __OWNER__ 替换为真实用户名）
-$script:GitHubRepo    = 'https://github.com/__OWNER__/AssetBridge'
+# 默认下载仓库（已推送 GitHub：github.com/zhdcirno/AssetBridge）
+$script:GitHubRepo    = 'https://github.com/zhdcirno/AssetBridge'
 $script:InstallSource = $null   # $null => 用本仓库 $ROOT/plugins；下载后指向解压目录
 
 # 各软件最低版本（用户硬性要求）
