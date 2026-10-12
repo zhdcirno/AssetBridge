@@ -1,0 +1,192 @@
+{
+  "_comment": "坐标/单位/轴向换算档案。每对 (源->目标) 一条。数值均为默认值，首次接入新版本软件请用 tools/calibrate.py 跑一次自检后覆盖。",
+  "schema": 1,
+  "apps": {
+    "blender": {
+      "display": "Blender",
+      "up_axis": "Z",
+      "forward_axis": "-Y",
+      "unit": "m",
+      "unit_to_cm": 100.0,
+      "handedness": "right",
+      "script_lang": "python",
+      "formats": [
+        "fbx",
+        "usd",
+        "gltf",
+        "obj"
+      ]
+    },
+    "unreal": {
+      "display": "Unreal Engine",
+      "up_axis": "Z",
+      "forward_axis": "X",
+      "unit": "cm",
+      "unit_to_cm": 1.0,
+      "handedness": "left",
+      "script_lang": "python",
+      "formats": [
+        "fbx",
+        "usd",
+        "obj"
+      ]
+    },
+    "maya": {
+      "display": "Maya",
+      "up_axis": "Y",
+      "forward_axis": "Z",
+      "unit": "cm",
+      "unit_to_cm": 1.0,
+      "handedness": "right",
+      "script_lang": "python",
+      "formats": [
+        "fbx",
+        "usd",
+        "obj",
+        "ma"
+      ]
+    },
+    "substance_painter": {
+      "display": "Substance 3D Painter",
+      "up_axis": "Y",
+      "forward_axis": "Z",
+      "unit": "cm",
+      "unit_to_cm": 1.0,
+      "handedness": "right",
+      "script_lang": "javascript-qml",
+      "formats": [
+        "fbx",
+        "obj",
+        "usd"
+      ],
+      "note": "SP 主要做「接收模型 / 回传贴图」，收发模型是次要路径"
+    }
+  },
+  "routes": {
+    "blender>unreal": {
+      "format": "fbx",
+      "export": {
+        "global_scale": 1.0,
+        "apply_unit_scale": true,
+        "use_space_transform": true,
+        "bake_space_transform": false,
+        "add_leaf_bones": false,
+        "primary_bone_axis": "Y",
+        "secondary_bone_axis": "X",
+        "path_mode": "COPY",
+        "embed_textures": true
+      },
+      "import": {
+        "_target": "unreal.FbxImportUI",
+        "convert_scene": true,
+        "convert_scene_unit": true,
+        "force_front_x_axis": false,
+        "import_uniform_scale": 1.0,
+        "combine_meshes": false,
+        "import_materials": true,
+        "import_textures": true,
+        "normal_import_method": "FBXNIM_IMPORT_NORMALS_AND_TANGENTS"
+      },
+      "_why": "两端都是 Z-up，无需换轴；米->厘米交给 UE 的 Convert Scene Unit 处理，因此导出端保持 1.0。"
+    },
+    "unreal>blender": {
+      "format": "fbx",
+      "export": {
+        "_note": "UE 用 EditorAssetLibrary.export_asset 或 Content Browser 的 Asset -> Export，FBX 以 cm 写出",
+        "ascii": false
+      },
+      "import": {
+        "_target": "bpy.ops.import_scene.fbx",
+        "global_scale": 1.0,
+        "use_manual_orientation": false,
+        "automatic_bone_orientation": true,
+        "use_prepost_rot": true
+      },
+      "_why": "Blender 5.0 的 FBX 导入器已内建 cm->m 换算，接收端必须是 1.0。实测（2026-09-24，Blender 5.0.1 + UE 5.8.3）：同一 UE 导出的 FBX，global_scale=1.0 -> 2.0m（正确）；0.01 -> 0.02m（缩小 100 倍，错）；100 -> 200m（错）。旧值 0.01 是基于老版本 Blender 的错误假设，已修正。",
+      "_measured": {
+        "date": "2026-09-24",
+        "blender": "5.0.1",
+        "unreal": "5.8.3",
+        "probe": {
+          "1.0": "2.0m 正确",
+          "0.01": "0.02m 错",
+          "100": "200m 错"
+        }
+      }
+    },
+    "maya>unreal": {
+      "format": "fbx",
+      "export": {
+        "_target": "FBXExport / file -type FBX",
+        "up_axis": "y",
+        "units": "cm",
+        "scale_factor": 1.0
+      },
+      "import": {
+        "_target": "unreal.FbxImportUI",
+        "convert_scene": true,
+        "convert_scene_unit": false,
+        "force_front_x_axis": false,
+        "import_uniform_scale": 1.0
+      },
+      "_why": "Maya 与 UE 同为 cm，无需缩放；Y-up -> Z-up 交给 UE 的 Convert Scene 处理。"
+    },
+    "unreal>maya": {
+      "format": "fbx",
+      "export": {
+        "units": "cm"
+      },
+      "import": {
+        "up_axis": "y",
+        "scale_factor": 1.0
+      },
+      "_why": "同 cm，只需在 Maya 侧把导入 Up Axis 设回 Y。"
+    },
+    "blender>substance_painter": {
+      "format": "fbx",
+      "export": {
+        "global_scale": 1.0,
+        "apply_unit_scale": true,
+        "axis_forward": "-Z",
+        "axis_up": "Y"
+      },
+      "import": {
+        "convert_to_y_up": true
+      },
+      "_why": "SP 是 Y-up / cm，但 Blender 5.0 导出的 FBX 有效单位已是 cm，所以 global_scale 保持 1.0（实测用 100.0 会放大 100 倍）。只需把 Z-up 转成 Y-up。",
+      "_status": "SP 侧尚未实机验证"
+    },
+    "substance_painter>unreal": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "回传的是贴图而非模型：baseColor/normal/ORM 等，走同一条 transfer 通道，kind=textures"
+    },
+    "blender>maya": {
+      "format": "fbx",
+      "export": {
+        "global_scale": 1.0,
+        "apply_unit_scale": true,
+        "use_space_transform": true
+      },
+      "import": {
+        "_target": "file -import / FBXImport",
+        "up_axis": "y",
+        "scale_factor": 1.0
+      },
+      "_why": "Blender 5.0 导出的 FBX 有效单位已是 cm，Maya 也是 cm，所以 scale 保持 1.0，只需在 Maya 侧把导入 Up Axis 设回 Y。实测（Maya 2023）：1m 立方体导入后为 100cm，往返无损。",
+      "_measured": {
+        "date": "2026-09-24",
+        "blender": "5.0.1",
+        "maya": "2023"
+      }
+    }
+  },
+  "naming": {
+    "static_mesh": "SM_{name}",
+    "skeletal_mesh": "SK_{name}",
+    "skeleton": "SKEL_{name}",
+    "texture": "T_{name}_{channel}",
+    "material": "M_{name}",
+    "material_instance": "MI_{name}"
+  }
+}

@@ -1,0 +1,25 @@
+# ---- 生成物 / 运行时 ----
+runtime/
+logs/
+backups/
+__pycache__/
+*.pyc
+*.pyo
+*.bak_*
+.DS_Store
+Thumbs.db
+
+# ---- 用户本地工作工程（本机测试用，不进仓库）----
+unreal/
+
+# ---- Python 虚拟环境 ----
+.venv/
+venv/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+
+# ---- 操作系统 ----
+ehthumbs.db
+Desktop.ini

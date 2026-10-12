@@ -1,0 +1,1111 @@
+﻿# ============================================================================
+#  Asset Bridge - 托盘守护程序 (tray supervisor)
+#
+#  * 常驻系统托盘，没有任何窗口
+#  * 图标四态：绿=运行中 / 琥珀=掉线(守护会自动拉起) / 灰=运行中但守护暂停 / 红=已停止
+#  * 右键菜单：启动 / 停止 / 重启 / 暂停守护 / 打开日志 / 打开项目文件夹 / 设置 / 退出
+#  * 双击图标 = 打开状态小窗（关闭后缩回托盘，不退出）
+#  * 每隔 N 秒自检，服务掉了自动拉起（可用"暂停守护"关掉）
+#  * 由 assetbridge_tray_launch.vbs 以「窗口样式 0」启动（零窗口，无 cmd 常驻）
+#
+#  日志：E:\CirnoWorkSpace\AssetBridge\logs\tray.log
+#  服务日志：E:\CirnoWorkSpace\AssetBridge\logs\server_console.log
+#  配置：E:\CirnoWorkSpace\AssetBridge\tray\tray_config.json
+# ============================================================================
+$ErrorActionPreference = 'Stop'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ---- 藏掉自己的控制台窗口（双保险）----------------------------------------
+# 正常路径：由 assetbridge_tray_launch.vbs 以「窗口样式 0」启动，本来就没有窗口。
+# 万一有人直接双击本 .ps1，这一段会把控制台立刻藏起来。
+try {
+    $sig = '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();' +
+           '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'
+    $w32 = Add-Type -MemberDefinition $sig -Name 'AbTrayCon' -Namespace 'AbTray' -PassThru
+    $h = $w32::GetConsoleWindow()
+    if ($h -ne [IntPtr]::Zero) { [void]$w32::ShowWindow($h, 0) }
+} catch { }
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ROOT      = Split-Path -Parent $ScriptDir
+$PYTHON    = 'C:\Users\12069\.workbuddy\binaries\python\versions\3.13.12\python.exe'
+$PYTHONW   = Join-Path (Split-Path -Parent $PYTHON) 'pythonw.exe'
+$SERVER    = Join-Path $ROOT 'server\server.py'
+$RUNSERVER = Join-Path $ScriptDir 'run_server.py'
+$RUNTIME   = Join-Path $ROOT 'runtime'
+$LOGDIR    = Join-Path $ROOT 'logs'
+$LOG       = Join-Path $LOGDIR 'tray.log'
+$SRVLOG    = Join-Path $LOGDIR 'server_console.log'
+$CONFIG    = Join-Path $ScriptDir 'tray_config.json'
+$LOCKFILE  = Join-Path $LOGDIR 'tray.lock'
+$ICONSRC   = Join-Path $ROOT 'assets\icons\png\16'   # 状态窗按钮用的小图标（16px）
+$APPICON   = Join-Path $ROOT 'assets\icons\ico\app_logo.ico'
+
+$ICON_OK     = Join-Path $ScriptDir 'icon_ok.ico'       # 绿：运行中
+$ICON_DOWN   = Join-Path $ScriptDir 'icon_down.ico'     # 红：已停止（守护已暂停，不会自动拉起）
+$ICON_WARN   = Join-Path $ScriptDir 'icon_warn.ico'     # 琥珀：掉线，守护会自动拉起
+$ICON_PAUSED = Join-Path $ScriptDir 'icon_paused.ico'   # 灰：运行中但守护被暂停
+# 图标来源：assets\icons\（由 tools\gen_icons.py 生成，可改配色后重新生成）
+
+# ---- 窗口图标（标题栏 + 任务栏）--------------------------------------------
+# 关键坑：WinForms 的 Form.Icon 只设置「大图标」(标题栏左上角)，
+# 任务栏 / Alt-Tab 用的是窗口的「小图标」，不会自动从 Icon 派生。
+# 不显式设置 -> 任务栏一律回退到 powershell.exe 的默认图标。
+# 解决：用 WM_SETICON 显式设置 ICON_SMALL(0) 与 ICON_BIG(1)。
+# 用 CopyIcon 复制一份句柄交给窗口，避免与 Icon 对象自身的句柄重复释放。
+try {
+    Add-Type -MemberDefinition @'
+    [DllImport("user32.dll", CharSet=CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern IntPtr CopyIcon(IntPtr hIcon);
+'@ -Name 'AbWinIcon' -Namespace 'AbTray' -ErrorAction SilentlyContinue
+} catch { }
+
+$script:AppLogo = $null
+if (Test-Path $APPICON) {
+    try { $script:AppLogo = New-Object System.Drawing.Icon -ArgumentList $APPICON } catch { }
+}
+
+function Set-FormIcon([System.Windows.Forms.Form]$form) {
+    if ($script:AppLogo -eq $null) { return }
+    try {
+        if ($form.IsHandleCreated -eq $false) { $form.CreateControl() }
+        $hBig   = [AbTray.AbWinIcon]::CopyIcon($script:AppLogo.Handle)
+        $hSmall = [AbTray.AbWinIcon]::CopyIcon($script:AppLogo.Handle)
+        if ($hBig   -ne [IntPtr]::Zero) { [void][AbTray.AbWinIcon]::SendMessage($form.Handle, 0x0080, [IntPtr]::new(1), $hBig) }
+        if ($hSmall -ne [IntPtr]::Zero) { [void][AbTray.AbWinIcon]::SendMessage($form.Handle, 0x0080, [IntPtr]::Zero, $hSmall) }
+    } catch { }
+}
+
+function Log([string]$m) {
+    $line = ('{0} [tray] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
+    try {
+        if (-not (Test-Path $LOGDIR)) { New-Item -ItemType Directory -Path $LOGDIR -Force | Out-Null }
+        $line | Out-File -Append -Encoding utf8 $LOG
+    } catch { }
+}
+
+function Get-AbImage([string]$file) {
+    # 状态窗按钮上的小图标。读不到就返回 $null（按钮不显示图标，不影响功能）。
+    #
+    # 注意：不能用 Image.FromFile —— 它会一直**锁住文件**，导致生成脚本无法覆盖重写。
+    # 这里读成字节流再拷一份 Bitmap，既不锁文件也不受流生命周期影响。
+    try {
+        $p = Join-Path $ICONSRC $file
+        if (-not (Test-Path $p)) { return $null }
+        $bytes = [System.IO.File]::ReadAllBytes($p)
+        $ms = New-Object System.IO.MemoryStream(,$bytes)
+        try {
+            $tmp = [System.Drawing.Image]::FromStream($ms)
+            $img = New-Object System.Drawing.Bitmap($tmp)   # 独立副本
+            $tmp.Dispose()
+            return $img
+        } finally { $ms.Dispose() }
+    } catch { }
+    return $null
+}
+
+function New-AbButton($parent, [string]$text, [string]$icon, [int]$x, [int]$w) {
+    # 带图标的状态窗按钮（图标放左侧、文字靠右）
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.SetBounds($x, 274, $w, 32)
+    $img = Get-AbImage $icon
+    if ($img -ne $null) {
+        $b.Image      = $img
+        $b.ImageAlign = 'MiddleLeft'
+        $b.TextAlign  = 'MiddleRight'
+    }
+    [void]$parent.Controls.Add($b)
+    return $b
+}
+
+# 隐藏窗口下如果发生未处理异常是「静默无声」的（没有控制台可看），
+# 所以兜底写进日志，便于事后定位。
+trap {
+    try { Log ('未处理异常: {0}' -f $_.Exception.Message) } catch { }
+    break
+}
+
+# ---- 单实例保护 -----------------------------------------------------------
+# 互斥量 + PID 锁文件双保险：
+# 互斥量只说明"曾经有人持有着"，但旧实例若没正常退出（比如被 FormClosing 卡住），
+# 它会一直存在，于是新实例永远起不来。所以还要用锁文件里的 PID 复核一下：
+# 那个进程已经不在了 -> 判定为残留，本次接管。
+$script:ReallyExit = $false
+$createdNew = $false
+$mutex = New-Object System.Threading.Mutex($true, 'Global\AssetBridgeTraySingleton', [ref]$createdNew)
+if (-not $createdNew) {
+    $stale = $true
+    if (Test-Path $LOCKFILE) {
+        try {
+            $oldPid = [int]((Get-Content $LOCKFILE -Raw).Trim())
+            $null = Get-Process -Id $oldPid -ErrorAction Stop
+            $stale = $false          # 进程还活着 -> 确实是重复启动
+        } catch { $stale = $true }
+    }
+    if (-not $stale) {
+        Log '托盘已在运行，退出本次启动'
+        exit
+    }
+    Log ('发现残留的互斥量（旧 pid 已不存在）-> 本次接管')
+}
+try { Set-Content -Path $LOCKFILE -Value $PID -Encoding ascii } catch { }
+
+function Exit-Tray {
+    # 真正退出：必须先置位，否则状态窗的 FormClosing 会把关闭动作取消掉，
+    # 导致 Application.Exit() 无效、进程永远退不出去（图标已隐藏 => 看起来像退了）。
+    $script:ReallyExit = $true
+    try { if ($script:Form -ne $null) { $script:Form.Dispose() } } catch { }
+    try { $ni.Visible = $false } catch { }
+    try { $mutex.ReleaseMutex() } catch { }
+    try { $mutex.Dispose() } catch { }
+    try {
+        foreach ($k in @($script:IconCache.Keys)) {
+            try { $script:IconCache[$k].icon.Dispose() } catch { }
+        }
+        $script:IconCache = @{}
+    } catch { }
+    try { if (Test-Path $LOCKFILE) { Remove-Item $LOCKFILE -Force } } catch { }
+    [System.Windows.Forms.Application]::Exit()
+}
+
+$script:Port     = 27631
+$script:Interval = 10
+$script:Guard    = $true
+$script:LastUp   = $false
+$script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服务端 /api/v1/config 取
+$script:PidCache   = @{ pid = 0; ts = 0 }   # Get-ServerPid 的缓存（见该函数内的性能说明）
+
+function Load-Config {
+    if (Test-Path $CONFIG) {
+        try {
+            $c = Get-Content $CONFIG -Raw -Encoding utf8 | ConvertFrom-Json
+            if ($c.port)     { $script:Port = [int]$c.port }
+            if ($c.interval) { $script:Interval = [int]$c.interval }
+            if ($c.payload_dir) { $script:PayloadDir = [string]$c.payload_dir }
+        } catch { Log ('读取配置失败: {0}' -f $_) }
+    }
+}
+function Save-Config {
+    try {
+        ([ordered]@{ port = $script:Port; interval = $script:Interval;
+                     payload_dir = $script:PayloadDir } | ConvertTo-Json) |
+            Out-File -Encoding utf8 $CONFIG
+    } catch { Log ('写入配置失败: {0}' -f $_) }
+}
+
+# 取中转文件路径（服务端负载目录）。优先问服务端 /api/v1/config，
+# 服务端没开就退回上次已知值，再退回默认 runtime\payloads。
+function Get-PayloadDir {
+    try {
+        $req = [System.Net.WebRequest]::Create(('http://127.0.0.1:{0}/api/v1/config' -f $script:Port))
+        $req.Method  = 'GET'
+        $req.Timeout = 1500
+        $req.Proxy   = $null      # 本机回环不走系统代理
+        $resp = $req.GetResponse()
+        $sr   = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+        $json = $sr.ReadToEnd()
+        $sr.Close(); $resp.Close()
+        $o = $json | ConvertFrom-Json
+        if ($o.payload_dir) {
+            $script:PayloadDir = [string]$o.payload_dir
+            return $script:PayloadDir
+        }
+    } catch { }
+    if ($script:PayloadDir) { return $script:PayloadDir }
+    return (Join-Path $ROOT 'runtime\payloads')
+}
+
+# 用系统资源管理器打开目录（不存在则弹提示）
+function Open-Folder([string]$p) {
+    if ([string]::IsNullOrWhiteSpace($p) -or -not (Test-Path $p)) {
+        [System.Windows.Forms.MessageBox]::Show(('路径不存在：{0}' -f $p), 'Asset Bridge') | Out-Null
+        return
+    }
+    Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $p)
+    Log ('已打开目录 {0}' -f $p)
+}
+
+# ---- 服务控制 -------------------------------------------------------------
+function Test-Server {
+    $tcp = $null
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $ar = $tcp.BeginConnect('127.0.0.1', $script:Port, $null, $null)
+        $ok = $ar.AsyncWaitHandle.WaitOne(900, $false)
+        if ($ok -and $tcp.Connected) { return $true }
+        return $false
+    } catch { return $false }
+    finally { if ($tcp -ne $null) { try { $tcp.Close() } catch { } } }
+}
+
+function Get-ServerPid {
+    # ⚠️ 性能：Get-NetTCPConnection 每次都要枚举系统全部 TCP 连接，单次可达 0.5~2 秒；
+    # 而 Refresh-State 会连调本函数两次（托盘提示 + 状态窗）——
+    # 这正是「每次打开窗口/点确定都卡 1 秒」的根源。所以这里加缓存：
+    #   查到过 -> 30 秒缓存；没查到 -> 8 秒短缓存（尽快发现服务起/停）。
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $ttl = 30000
+    if ([int]$script:PidCache.pid -le 0) { $ttl = 8000 }
+    if (($now - [long]$script:PidCache.ts) -lt $ttl) { return [int]$script:PidCache.pid }
+
+    $p = 0
+    try {
+        $c = Get-NetTCPConnection -LocalPort $script:Port -State Listen -ErrorAction Stop
+        if ($c) { $p = [int]($c | Select-Object -First 1).OwningProcess }
+    } catch { }
+    if ($p -le 0) {
+        # 兜底：解析 netstat 输出（老系统或 cmdlet 不可用时）
+        try {
+            foreach ($ln in (netstat -ano)) {
+                if ($ln -match ('{0}\s' -f $script:Port) -and $ln -match 'LISTENING') {
+                    $f = @(($ln -split '\s+') | Where-Object { $_ -ne '' })
+                    if ($f.Count -ge 5) { $p = [int]$f[$f.Count - 1]; break }
+                }
+            }
+        } catch { }
+    }
+    $script:PidCache = @{ pid = $p; ts = $now }
+    return $p
+}
+
+function Reset-ServerPidCache {
+    $script:PidCache = @{ pid = 0; ts = 0 }
+}
+
+function Start-Server {
+    if (Test-Server) { Log '启动跳过：已在运行'; return }
+    try {
+        # pythonw + run_server.py -> 完全没有控制台窗口，且与托盘进程解耦：
+        # 退出托盘不会连带杀掉中转服务。
+        $exe = $PYTHONW
+        if (-not (Test-Path $exe)) { $exe = $PYTHON }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName         = $exe
+        $psi.Arguments        = ('-u "{0}"' -f $RUNSERVER)
+        $psi.WorkingDirectory = $ROOT
+        $psi.WindowStyle      = 'Hidden'
+        $psi.UseShellExecute  = $false
+        $psi.CreateNoWindow   = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        Log ('已启动服务 pid={0} ({1}) log={2}' -f $p.Id, (Split-Path -Leaf $exe), $SRVLOG)
+        # 直接把新 pid 写进缓存：不用再走一次慢查询，tooltip 也能立刻显示正确 pid
+        $script:PidCache = @{ pid = [int]$p.Id; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+    } catch { Log ('启动服务失败: {0}' -f $_) }
+}
+
+function Stop-Server {
+    $p = Get-ServerPid
+    if ($p -le 0) { Log '停止跳过：服务未运行'; return }
+
+    # ---- 1) 优雅关闭：POST /api/v1/shutdown --------------------------------
+    # 不需要任何进程权限，跨会话同样有效。杀进程只是兜底。
+    # 注意：必须绕过系统代理（连 127.0.0.1 也会被劫成 502）。
+    try {
+        $req = [System.Net.WebRequest]::Create(('http://127.0.0.1:{0}/api/v1/shutdown' -f $script:Port))
+        $req.Method        = 'POST'
+        $req.Proxy         = $null
+        $req.Timeout       = 2000
+        $req.ContentLength = 0
+        $resp = $req.GetResponse()
+        if ($resp -ne $null) { $resp.Close() }
+        Log ('已请求优雅关闭 pid={0}' -f $p)
+    } catch {
+        Log ('优雅关闭请求失败 pid={0}: {1}' -f $p, $_.Exception.Message)
+    }
+
+    # ---- 2) 等它自己退出（最多 5 秒）--------------------------------------
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 200
+        if (-not (Test-Server)) { Log ('服务已停止 pid={0}（优雅关闭）' -f $p); return }
+    }
+
+    # ---- 3) 兜底：强杀进程 ------------------------------------------------
+    # 只有当服务是「本托盘拉起的」（同会话）才杀得动；别处起的服务会拒绝访问。
+    try {
+        Stop-Process -Id $p -Force -ErrorAction Stop
+        Log ('已强制停止服务 pid={0}' -f $p)
+    } catch {
+        Log ('强杀失败 pid={0}: {1}' -f $p, $_.Exception.Message)
+        Log ('  -> 该进程不是本托盘启动的（多半是别的终端/会话起的）。可手动结束：taskkill /F /PID {0}' -f $p)
+    }
+}
+
+# ---- 界面 -----------------------------------------------------------------
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$ni = New-Object System.Windows.Forms.NotifyIcon
+$script:IconCache = @{}          # 状态 -> @{ ts=文件时间戳; icon=Icon 对象 }
+function Apply-Icon([string]$state) {
+    # 四态：ok=绿 / warn=琥珀 / paused=灰 / down=红（读不到文件时退回系统图标）
+    switch ($state) {
+        'ok'     { $path = $ICON_OK;     $fb = [System.Drawing.SystemIcons]::Information }
+        'warn'   { $path = $ICON_WARN;   $fb = [System.Drawing.SystemIcons]::Warning }
+        'paused' { $path = $ICON_PAUSED; $fb = [System.Drawing.SystemIcons]::Shield }
+        default  { $path = $ICON_DOWN;   $fb = [System.Drawing.SystemIcons]::Error }
+    }
+    # 按「文件修改时间」缓存：既不会每 10 秒重建 Icon（会泄漏 GDI 句柄），
+    # 又能在磁盘上的图标被替换后自动换新的 —— 不用重启托盘。
+    if (Test-Path $path) {
+        try {
+            $ts = (Get-Item $path).LastWriteTimeUtc.Ticks
+            $e  = $script:IconCache[$state]
+            if ($e -eq $null -or $e.ts -ne $ts) {
+                $ico = New-Object System.Drawing.Icon -ArgumentList $path
+                if ($e -ne $null -and $e.icon -ne $null) { try { $e.icon.Dispose() } catch { } }
+                $script:IconCache[$state] = @{ ts = $ts; icon = $ico }
+            }
+            $ni.Icon = $script:IconCache[$state].icon
+            return
+        } catch { }
+    }
+    $ni.Icon = $fb
+}
+
+$script:StatusLabel = $null
+$script:LogBox      = $null
+
+function Refresh-State {
+    $up = Test-Server
+    $script:LastUp = $up
+
+    # 图标四态：运行/掉线待自愈/运行但守护暂停/已停止
+    $state = 'down'
+    if ($up) {
+        if ($script:Guard) { $state = 'ok' } else { $state = 'paused' }
+    } else {
+        if ($script:Guard) { $state = 'warn' } else { $state = 'down' }
+    }
+    Apply-Icon $state
+
+    if ($up) {
+        $p = Get-ServerPid
+        if ($script:Guard) {
+            $ni.Text = ('AssetBridge 运行中 :{0} pid={1}' -f $script:Port, $p)
+        } else {
+            $ni.Text = ('AssetBridge 运行中(守护已暂停) :{0}' -f $script:Port)
+        }
+    } else {
+        if ($script:Guard) {
+            $ni.Text = ('AssetBridge 已停止 :{0} (等待自动拉起)' -f $script:Port)
+        } else {
+            $ni.Text = ('AssetBridge 已停止 :{0}' -f $script:Port)
+        }
+    }
+    if ($script:StatusLabel -ne $null) { Update-StatusWindow }
+}
+
+function Update-StatusWindow {
+    if ($script:StatusLabel -eq $null) { return }
+    $up = $script:LastUp
+    if ($up) {
+        $p = Get-ServerPid
+        $script:StatusLabel.Text = ('状态：运行中    端口 {0}    PID {1}    守护：{2}' -f `
+            $script:Port, $p, (&{ if ($script:Guard) { '开启' } else { '已暂停' } }))
+        $script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(30, 130, 60)
+    } else {
+        $script:StatusLabel.Text = ('状态：已停止    端口 {0}    守护：{1}' -f `
+            $script:Port, (&{ if ($script:Guard) { '开启' } else { '已暂停' } }))
+        $script:StatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 50, 40)
+    }
+    if ($script:LogBox -ne $null) {
+        try {
+            if (Test-Path $LOG) {
+                $tail = Get-Content $LOG -Tail 14 -Encoding utf8
+                $script:LogBox.Lines = $tail
+                $script:LogBox.SelectionStart = $script:LogBox.Text.Length
+                $script:LogBox.ScrollToCaret()
+            }
+        } catch { }
+    }
+}
+
+# ---- 右键菜单 -------------------------------------------------------------
+$menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+$miState = $menu.Items.Add('状态：检查中...')
+$miState.Enabled = $false
+[void]$menu.Items.Add('-')
+$miStart   = $menu.Items.Add('启动服务')
+$miStop    = $menu.Items.Add('停止服务')
+$miRestart = $menu.Items.Add('重启服务')
+[void]$menu.Items.Add('-')
+$miGuard   = $menu.Items.Add('暂停守护')
+[void]$menu.Items.Add('-')
+$miLog     = $menu.Items.Add('打开托盘日志')
+$miSrvLog  = $menu.Items.Add('打开服务日志')
+$miFolder  = $menu.Items.Add('打开项目文件夹')
+$miPayload = $menu.Items.Add('打开中转文件目录')
+[void]$menu.Items.Add('-')
+$miSet     = $menu.Items.Add('设置...')
+[void]$menu.Items.Add('-')
+$miInstall = $menu.Items.Add('安装插件...')
+[void]$menu.Items.Add('-')
+$miExitAll = $menu.Items.Add('退出并停止服务')
+$miExit    = $menu.Items.Add('退出（服务保持运行）')
+
+$miStart.add_Click({   Start-Server;  Start-Sleep -Milliseconds 400; Refresh-State })
+$miStop.add_Click({    Stop-Server;   Start-Sleep -Milliseconds 400; Refresh-State })
+$miRestart.add_Click({ Stop-Server;   Start-Sleep -Seconds 1; Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+$miGuard.add_Click({
+    $script:Guard = -not $script:Guard
+    if ($script:Guard) { $miGuard.Text = '暂停守护'; Log '守护已恢复' } else { $miGuard.Text = '恢复守护'; Log '守护已暂停' }
+    Refresh-State
+})
+$miLog.add_Click({    Start-Process -FilePath 'notepad.exe' -ArgumentList $LOG })
+$miSrvLog.add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList $SRVLOG })
+$miFolder.add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList $ROOT })
+$miPayload.add_Click({ Open-Folder (Get-PayloadDir) })
+$miExitAll.add_Click({
+    Stop-Server
+    Log '托盘退出并停止服务'
+    Exit-Tray
+})
+$miExit.add_Click({
+    Log '托盘退出（服务保持运行）'
+    Exit-Tray
+})
+# 右键「设置...」之前漏绑了点击事件（只有状态窗里的按钮绑了 Show-Settings），
+# 导致右键点了没反应。这里补上。
+$miSet.add_Click({ Show-Settings })
+$miInstall.add_Click({ Show-Installer })
+
+$ni.ContextMenuStrip = $menu
+
+# ---- 状态小窗（双击托盘图标打开；关闭 = 缩回托盘）------------------------
+$script:Form = $null
+function Show-StatusWindow {
+    if ($script:Form -eq $null) {
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text            = 'Asset Bridge 状态'
+        $f.ClientSize      = New-Object System.Drawing.Size(560, 330)
+        $f.StartPosition   = 'CenterScreen'
+        $f.MinimizeBox     = $true
+        $f.ShowInTaskbar   = $true
+
+        $script:StatusLabel = New-Object System.Windows.Forms.Label
+        $script:StatusLabel.SetBounds(14, 12, 530, 24)
+        $script:StatusLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
+        $f.Controls.Add($script:StatusLabel)
+
+        $script:LogBox = New-Object System.Windows.Forms.TextBox
+        $script:LogBox.SetBounds(14, 46, 530, 216)
+        $script:LogBox.Multiline   = $true
+        $script:LogBox.ReadOnly    = $true
+        $script:LogBox.WordWrap    = $true    # 日志自动换行
+        $script:LogBox.ScrollBars  = 'Vertical'
+        $script:LogBox.BackColor   = [System.Drawing.Color]::White
+        $script:LogBox.Font        = New-Object System.Drawing.Font('Consolas', 9)
+        $f.Controls.Add($script:LogBox)
+
+        # 窗口图标：标题栏 + 任务栏都设为 app_logo（任务栏小图标见 Set-FormIcon）
+        Set-FormIcon $f
+
+        # 按钮：左侧 16px 小图标 + 右侧文字（图标来自 assets\icons\png\16）
+        $b1 = New-AbButton $f '启动'       'act_start.png'    14  96
+        $b1.add_Click({ Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+
+        $b2 = New-AbButton $f '停止'       'act_stop.png'     118 96
+        $b2.add_Click({ Stop-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+
+        $b3 = New-AbButton $f '重启'       'act_restart.png'  222 96
+        $b3.add_Click({ Stop-Server; Start-Sleep -Seconds 1; Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+
+        $b4 = New-AbButton $f '设置...'    'act_settings.png' 326 96
+        $b4.add_Click({ Show-Settings })
+
+        $b5 = New-AbButton $f '隐藏到托盘' 'state_paused.png'  430 124
+        $b5.add_Click({ $script:Form.Hide() })
+
+        # 关闭 = 缩回托盘；但「真正退出」时不能拦截，否则 Application.Exit() 会被取消
+        $f.add_FormClosing({ param($sender, $e)
+            if ($script:ReallyExit) { return }
+            $e.Cancel = $true
+            $sender.Hide()
+        })
+        $script:Form = $f
+    }
+    Update-StatusWindow
+    $script:Form.Show()
+    $script:Form.Activate()
+}
+
+# ---- 设置窗 ---------------------------------------------------------------
+function Show-Settings {
+    $d = New-Object System.Windows.Forms.Form
+    $d.Text          = 'Asset Bridge 设置'
+    $d.ClientSize    = New-Object System.Drawing.Size(400, 210)
+    $d.StartPosition = 'CenterParent'
+    $d.FormBorderStyle = 'FixedDialog'
+    $d.MaximizeBox   = $false
+    $d.MinimizeBox   = $false
+
+    $l1 = New-Object System.Windows.Forms.Label
+    $l1.Text = '服务端口'; $l1.SetBounds(16, 20, 90, 22); $d.Controls.Add($l1)
+    $t1 = New-Object System.Windows.Forms.TextBox
+    $t1.Text = [string]$script:Port; $t1.SetBounds(112, 18, 274, 24); $d.Controls.Add($t1)
+
+    $l2 = New-Object System.Windows.Forms.Label
+    $l2.Text = '自检间隔(秒)'; $l2.SetBounds(16, 56, 90, 22); $d.Controls.Add($l2)
+    $t2 = New-Object System.Windows.Forms.TextBox
+    $t2.Text = [string]$script:Interval; $t2.SetBounds(112, 54, 274, 24); $d.Controls.Add($t2)
+
+    # 中转文件路径：打开设置时自动填入服务端当前的负载目录
+    $l3 = New-Object System.Windows.Forms.Label
+    $l3.Text = '中转文件路径'; $l3.SetBounds(16, 92, 90, 22); $d.Controls.Add($l3)
+    $t3 = New-Object System.Windows.Forms.TextBox
+    $t3.Text = (Get-PayloadDir); $t3.SetBounds(112, 90, 184, 24); $d.Controls.Add($t3)
+    $ob = New-Object System.Windows.Forms.Button
+    $ob.Text = '打开文件夹'; $ob.SetBounds(302, 89, 84, 26)
+    $ob.add_Click({ Open-Folder ([string]$t3.Text) })
+    $d.Controls.Add($ob)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '该目录存放各软件互传的模型/贴图，由中转服务管理'
+    $hint.ForeColor = [System.Drawing.Color]::Gray
+    $hint.SetBounds(112, 118, 274, 18); $d.Controls.Add($hint)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = '确定'; $ok.SetBounds(112, 152, 88, 30)
+    $ok.add_Click({
+        try {
+            $np = [int]$t1.Text
+            $ni2 = [int]$t2.Text
+            if ($np -lt 1 -or $np -gt 65535) { throw '端口范围应为 1-65535' }
+            if ($ni2 -lt 3 -or $ni2 -gt 600) { throw '间隔范围应为 3-600 秒' }
+            $script:Port = $np
+            $script:Interval = $ni2
+            $script:PayloadDir = ([string]$t3.Text).Trim()
+            $timer.Interval = $script:Interval * 1000
+            Save-Config
+            Log ('设置已更新 port={0} interval={1} payload={2}' -f $np, $ni2, $script:PayloadDir)
+            $d.Close()
+            Refresh-State
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show(('设置无效：{0}' -f $_), 'Asset Bridge') | Out-Null
+        }
+    })
+    $d.Controls.Add($ok)
+
+    $ca = New-Object System.Windows.Forms.Button
+    $ca.Text = '取消'; $ca.SetBounds(214, 152, 88, 30)
+    $ca.add_Click({ $d.Close() })
+    $d.Controls.Add($ca)
+
+    Set-FormIcon $d
+
+    [void]$d.ShowDialog()
+}
+
+# ===========================================================================
+#  插件安装器：自动识别本机 DCC 软件 + 版本校验 + 一键安装 + 从 GitHub 下载
+# ===========================================================================
+# 默认下载仓库（推送 GitHub 后把 __OWNER__ 替换为真实用户名）
+$script:GitHubRepo    = 'https://github.com/__OWNER__/AssetBridge'
+$script:InstallSource = $null   # $null => 用本仓库 $ROOT/plugins；下载后指向解压目录
+
+# 各软件最低版本（用户硬性要求）
+$MIN_BLENDER  = '5.0'
+$MIN_MAYA     = '2023'
+$MIN_SP       = '10.0.1'
+$MIN_SP_BUILD = 3757
+$MIN_UE       = '5.8'
+
+function Parse-Version([string]$s) {
+    $out = @()
+    foreach ($p in ($s -split '[.\-]')) {
+        $n = 0
+        if ([int]::TryParse($p, [ref]$n)) { $out += $n }
+    }
+    return $out
+}
+function Ver-GE($a, $b) {
+    $va = Parse-Version $a; $vb = Parse-Version $b
+    $n = [Math]::Max($va.Count, $vb.Count)
+    for ($i = 0; $i -lt $n; $i++) {
+        $x = if ($i -lt $va.Count) { $va[$i] } else { 0 }
+        $y = if ($i -lt $vb.Count) { $vb[$i] } else { 0 }
+        if ($x -ne $y) { return ($x -gt $y) }
+    }
+    return $true
+}
+function Get-LnkTarget([string]$lnk) {
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($lnk)
+        $txt = [System.Text.Encoding]::Unicode.GetString($bytes)
+        foreach ($tok in ($txt -split "`0")) {
+            if ($tok -match '\.exe$') { return $tok.Trim() }
+        }
+    } catch { }
+    return ''
+}
+function Get-AppSourceDir([string]$rel) {
+    $base = if ($script:InstallSource) { $script:InstallSource } else { $ROOT }
+    return Join-Path $base $rel
+}
+function Get-ExeVer([string]$exe) {
+    try {
+        $vi = (Get-Item $exe -ErrorAction Stop).VersionInfo
+        if ($vi -and $vi.ProductVersion) { return $vi.ProductVersion }
+        if ($vi -and $vi.FileVersion)   { return $vi.FileVersion }
+    } catch { }
+    return ''
+}
+function Find-Blender {
+    $exes = @()
+    foreach ($r in @('D:\DCC', 'C:\Program Files\Blender Foundation')) {
+        if (Test-Path $r) {
+            foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
+                $c = Join-Path $d.FullName 'blender.exe'
+                if (Test-Path $c) { $exes += $c }
+            }
+        }
+    }
+    foreach ($ld in @((Join-Path $env:USERPROFILE 'Desktop'),
+                      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+        if (Test-Path $ld) {
+            foreach ($l in (Get-ChildItem $ld -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
+                $t = Get-LnkTarget $l.FullName
+                if ($t -match 'blender\.exe$' -and (Test-Path $t)) { $exes += $t }
+            }
+        }
+    }
+    $found = @()
+    foreach ($e in ($exes | Sort-Object -Unique)) {
+        $ver = Get-ExeVer $e
+        if (-not $ver -and ($e -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
+        if (-not $ver) { continue }
+        if (-not (Ver-GE $ver $MIN_BLENDER)) { continue }
+        $mm = ($ver -split '\.')[0..1] -join '.'
+        $found += [PSCustomObject]@{
+            key='blender'; name='Blender'; version=$ver; path=$e; min=$MIN_BLENDER;
+            dst = "$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender";
+            src = 'plugins/blender/asset_bridge_blender'
+        }
+    }
+    return $found
+}
+function Find-Maya {
+    $exes = @()
+    $r = 'C:\Program Files\Autodesk'
+    if (Test-Path $r) {
+        foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $d.FullName 'bin\maya.exe'
+            if (Test-Path $c) { $exes += $c }
+        }
+    }
+    $found = @()
+    foreach ($e in ($exes | Sort-Object -Unique)) {
+        $ver = ''
+        if ($e -match 'Maya(\d+)') { $ver = $Matches[1] }
+        if (-not $ver) { continue }
+        if (-not (Ver-GE $ver $MIN_MAYA)) { continue }
+        $found += [PSCustomObject]@{
+            key='maya'; name='Maya'; version=$ver; path=$e; min=$MIN_MAYA;
+            dst = "$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya";
+            src = 'plugins/maya/asset_bridge_maya'
+        }
+    }
+    return $found
+}
+function Find-SubstancePainter {
+    $exes = @()
+    foreach ($r in @('C:\Program Files\Adobe\Adobe Substance 3D Painter',
+                     'D:\DCC\Adobe Substance 3D Painter')) {
+        $c = Join-Path $r 'Adobe Substance 3D Painter.exe'
+        if (Test-Path $c) { $exes += $c }
+    }
+    foreach ($ld in @((Join-Path $env:USERPROFILE 'Desktop'),
+                      (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+        if (Test-Path $ld) {
+            foreach ($l in (Get-ChildItem $ld -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue)) {
+                $t = Get-LnkTarget $l.FullName
+                if ($t -match 'Substance 3D Painter\.exe$' -and (Test-Path $t)) { $exes += $t }
+            }
+        }
+    }
+    $found = @()
+    foreach ($e in ($exes | Sort-Object -Unique)) {
+        $pv = ''; $build = 0
+        try {
+            $vi = (Get-Item $e -ErrorAction Stop).VersionInfo
+            $pv = $vi.ProductVersion
+            if ($vi.FileVersion -match '(\d+)$') { $build = [int]$Matches[1] }
+        } catch { }
+        $ok = $false; $note = ''
+        if (-not $pv) { $note = '无法读取版本' }
+        elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
+        elseif (($pv -eq $MIN_SP) -and ($build -lt $MIN_SP_BUILD)) { $note = "构建号过低（需 >= build $MIN_SP_BUILD）" }
+        else { $ok = $true }
+        $found += [PSCustomObject]@{
+            key='sp'; name='Substance Painter'; version=$pv; path=$e; min="$MIN_SP (build $MIN_SP_BUILD)";
+            dst = "$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge";
+            src = 'plugins/substance_painter/asset-bridge';
+            ok = $ok; note = $note
+        }
+    }
+    return $found
+}
+function Find-Unreal {
+    $exes = @()
+    foreach ($r in @('G:\Engine', 'C:\Program Files\Epic Games')) {
+        if (Test-Path $r) {
+            foreach ($d in (Get-ChildItem $r -ErrorAction SilentlyContinue)) {
+                if ($d.Name -match '^UE[_ ]?(\d+\.\d+(?:\.\d+)?)') {
+                    $ed = Join-Path $d.FullName 'Engine\Binaries\Win64\UnrealEditor.exe'
+                    if (Test-Path $ed) { $exes += $ed }
+                }
+            }
+        }
+    }
+    try {
+        foreach ($k in (Get-ChildItem 'HKLM:\SOFTWARE\EpicGames\Unreal Engine' -ErrorAction SilentlyContinue)) {
+            $inst = (Get-ItemProperty $k.PSPath).InstalledDirectory
+            if ($inst -and (Test-Path $inst)) {
+                $ed = Join-Path $inst 'Engine\Binaries\Win64\UnrealEditor.exe'
+                if (Test-Path $ed) { $exes += $ed }
+            }
+        }
+    } catch { }
+    $found = @()
+    foreach ($e in ($exes | Sort-Object -Unique)) {
+        $ver = ''
+        if ($e -match 'UE[_ ]?(\d+\.\d+(?:\.\d+)?)') { $ver = $Matches[1] }
+        if (-not $ver) { continue }
+        $ok = (Ver-GE $ver $MIN_UE)
+        $found += [PSCustomObject]@{
+            key='ue'; name='Unreal Engine'; version=$ver; path=$e; min=$MIN_UE;
+            dst = (Join-Path (Split-Path (Split-Path $e) ) 'Plugins\AssetBridge');
+            src = 'plugins/unreal/AssetBridge';
+            ok = $ok; note = if ($ok) { '' } else { "版本过低（需 >= $MIN_UE）" }
+        }
+    }
+    return $found
+}
+function Find-AllApps {
+    $all = @()
+    $all += Find-Blender
+    $all += Find-Maya
+    $all += Find-SubstancePainter
+    $all += Find-Unreal
+    return $all
+}
+function Copy-Plugin([string]$src, [string]$dst, [string]$label) {
+    try {
+        if (-not (Test-Path $src)) { return "源缺失: $src" }
+        if (Test-Path $dst) {
+            $bk = $dst + '.bak_' + (Get-Date -Format 'yyyyMMddHHmmss')
+            Move-Item $dst $bk -Force
+        }
+        New-Item -ItemType Directory -Path (Split-Path $dst) -Force | Out-Null
+        Copy-Item $src $dst -Recurse -Force
+        return "已安装 $label -> $dst"
+    } catch { return "安装失败 $label : $_" }
+}
+function Install-App([PSCustomObject]$app) {
+    if (-not $app) { return '未检测到该软件' }
+    if ($app.ok -eq $false) { return "无法安装：$($app.note)" }
+    $src = Get-AppSourceDir $app.src
+    $msg = Copy-Plugin $src $app.dst $app.name
+    Log ('安装器: ' + $msg)
+    return $msg
+}
+function Get-PluginSourceFromGitHub {
+    $branch = 'main'
+    $zip = ($script:GitHubRepo -replace '/$', '') + "/archive/refs/heads/$branch.zip"
+    $tmp = Join-Path $env:TEMP ('AssetBridgeDL_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+    $zipPath = Join-Path $tmp 'repo.zip'
+    try {
+        Log ('安装器: 从 GitHub 下载 ' + $zip)
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $zip -OutFile $zipPath -ErrorAction Stop
+        Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
+        # GitHub 压缩包根目录为 仓库名-分支，例如 AssetBridge-main
+        $inner = Get-ChildItem $tmp -Directory | Where-Object { $_.Name -like 'AssetBridge-*' } | Select-Object -First 1
+        if ($inner -and (Test-Path (Join-Path $inner.FullName 'plugins'))) {
+            $script:InstallSource = $inner.FullName
+            return "已下载到 $($inner.FullName)"
+        }
+        return '下载完成但结构不符（未找到 plugins/ 目录）'
+    } catch {
+        return "下载失败: $_"
+    }
+}
+function Request-ManualPath([string]$key) {
+    # 未自动检测到时，让用户手动指定软件路径；返回与 Find-* 同结构的对象，或 $null
+    $app = $null
+    switch ($key) {
+        'blender' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'Blender 可执行文件|blender.exe'
+            $ofd.Title  = '选择 blender.exe'
+            if ($ofd.ShowDialog() -eq 'OK') {
+                $exe = $ofd.FileName
+                $ver = ''
+                $parent = Split-Path $exe
+                if ($parent -match '(\d+\.\d+(?:\.\d+)?)') { $ver = $Matches[1] }
+                if (-not $ver) { $ver = Get-ExeVer $exe }
+                if ($ver -and (Ver-GE $ver $MIN_BLENDER)) {
+                    $mm = ($ver -split '\.')[0..1] -join '.'
+                    $app = [PSCustomObject]@{
+                        key='blender'; name='Blender'; version=$ver; path=$exe; min=$MIN_BLENDER;
+                        dst = "$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender";
+                        src = 'plugins/blender/asset_bridge_blender'; ok=$true; note=''
+                    }
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("该 Blender 版本过低或无法识别（需 >= $MIN_BLENDER）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
+                }
+            }
+        }
+        'maya' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'Maya 可执行文件|maya.exe'
+            $ofd.Title  = '选择 maya.exe'
+            if ($ofd.ShowDialog() -eq 'OK') {
+                $exe = $ofd.FileName
+                $ver = ''
+                if ($exe -match 'Maya(\d+)') { $ver = $Matches[1] }
+                if (-not $ver) { $ver = Get-ExeVer $exe }
+                if ($ver -and (Ver-GE $ver $MIN_MAYA)) {
+                    $app = [PSCustomObject]@{
+                        key='maya'; name='Maya'; version=$ver; path=$exe; min=$MIN_MAYA;
+                        dst = "$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya";
+                        src = 'plugins/maya/asset_bridge_maya'; ok=$true; note=''
+                    }
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("该 Maya 版本过低或无法识别（需 >= $MIN_MAYA）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
+                }
+            }
+        }
+        'sp' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'Substance 3D Painter|*.exe'
+            $ofd.Title  = '选择 Substance 3D Painter.exe'
+            if ($ofd.ShowDialog() -eq 'OK') {
+                $exe = $ofd.FileName
+                $pv = ''; $build = 0
+                try {
+                    $vi = (Get-Item $exe -ErrorAction Stop).VersionInfo
+                    $pv = $vi.ProductVersion
+                    if ($vi.FileVersion -match '(\d+)$') { $build = [int]$Matches[1] }
+                } catch { }
+                $ok = $false; $note = ''
+                if (-not $pv) { $note = '无法读取版本' }
+                elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
+                elseif (($pv -eq $MIN_SP) -and ($build -lt $MIN_SP_BUILD)) { $note = "构建号过低（需 >= build $MIN_SP_BUILD）" }
+                else { $ok = $true }
+                if ($ok) {
+                    $app = [PSCustomObject]@{
+                        key='sp'; name='Substance Painter'; version=$pv; path=$exe; min="$MIN_SP (build $MIN_SP_BUILD)";
+                        dst = "$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge";
+                        src = 'plugins/substance_painter/asset-bridge'; ok=$true; note=''
+                    }
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("该 Substance Painter $note。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
+                }
+            }
+        }
+        'ue' {
+            $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+            $fbd.Description = '选择 Unreal Engine 安装根目录（需包含 Engine\Binaries\Win64\UnrealEditor.exe）'
+            $fbd.ShowNewFolderButton = $false
+            if ($fbd.ShowDialog() -eq 'OK') {
+                $root = $fbd.SelectedPath
+                $ed = Join-Path $root 'Engine\Binaries\Win64\UnrealEditor.exe'
+                if (-not (Test-Path $ed)) {
+                    [System.Windows.Forms.MessageBox]::Show("该目录不是 Unreal Engine 根目录`n（未找到 Engine\Binaries\Win64\UnrealEditor.exe）", '路径无效', 'OK', 'Warning') | Out-Null
+                } else {
+                    $ver = ''
+                    $bv = Join-Path $root 'Engine\Build\Build.version'
+                    if (Test-Path $bv) {
+                        try {
+                            $j = Get-Content $bv -Raw -Encoding UTF8 | ConvertFrom-Json
+                            $ver = "$($j.MajorVersion).$($j.MinorVersion)"
+                        } catch { }
+                    }
+                    if (-not $ver -and ($root -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
+                    if ($ver -and (Ver-GE $ver $MIN_UE)) {
+                        $app = [PSCustomObject]@{
+                            key='ue'; name='Unreal Engine'; version=$ver; path=$ed; min=$MIN_UE;
+                            dst = Join-Path $root 'Engine\Plugins\AssetBridge';
+                            src = 'plugins/unreal/AssetBridge'; ok=$true; note=''
+                        }
+                    } else {
+                        [System.Windows.Forms.MessageBox]::Show("该 Unreal Engine 版本过低或无法识别（需 >= $MIN_UE）。`n根目录: $root", '版本不符', 'OK', 'Warning') | Out-Null
+                    }
+                }
+            }
+        }
+    }
+    return $app
+}
+
+function Show-Installer {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Asset Bridge 插件安装器'
+    $form.ClientSize = New-Object System.Drawing.Size(560, 460)
+    $form.StartPosition = 'CenterParent'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false; $form.MinimizeBox = $false
+
+    $report = New-Object System.Windows.Forms.TextBox
+    $report.SetBounds(14, 14, 532, 205)
+    $report.Multiline = $true; $report.ReadOnly = $true; $report.ScrollBars = 'Vertical'
+    $report.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $form.Controls.Add($report)
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.SetBounds(14, 226, 532, 20)
+    $form.Controls.Add($status)
+
+    $bRefresh = New-Object System.Windows.Forms.Button
+    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 252, 100, 30)
+    $form.Controls.Add($bRefresh)
+
+    $bDl = New-Object System.Windows.Forms.Button
+    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 252, 160, 30)
+    $form.Controls.Add($bDl)
+
+    $lbl1 = New-Object System.Windows.Forms.Label
+    $lbl1.Text = '一键安装（检测到且版本达标时可用）：'; $lbl1.SetBounds(14, 290, 532, 18)
+    $form.Controls.Add($lbl1)
+
+    $bInstall = @{}
+    $xs = @(14, 150, 286, 422)
+    foreach ($meta in @(
+        @{k='blender'; t='安装 Blender'},
+        @{k='maya';    t='安装 Maya'},
+        @{k='sp';      t='安装 SP'},
+        @{k='ue';      t='安装 UE'})) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $meta.t; $b.SetBounds($xs[0], 308, 132, 30); $xs[0] += 136
+        $b.Enabled = $false
+        $b.Tag = $meta.k
+        $bInstall[$meta.k] = $b
+        $form.Controls.Add($b)
+    }
+
+    $lbl2 = New-Object System.Windows.Forms.Label
+    $lbl2.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl2.SetBounds(14, 346, 532, 18)
+    $form.Controls.Add($lbl2)
+
+    $bManual = @{}
+    $xs = @(14, 150, 286, 422)
+    foreach ($meta in @(
+        @{k='blender'; t='指定 Blender'},
+        @{k='maya';    t='指定 Maya'},
+        @{k='sp';      t='指定 SP'},
+        @{k='ue';      t='指定 UE'})) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $meta.t; $b.SetBounds($xs[0], 364, 132, 30); $xs[0] += 136
+        $b.Tag = $meta.k
+        $bManual[$meta.k] = $b
+        $form.Controls.Add($b)
+    }
+
+    $bClose = New-Object System.Windows.Forms.Button
+    $bClose.Text = '关闭'; $bClose.SetBounds(232, 408, 96, 30)
+    $bClose.add_Click({ $form.Close() })
+    $form.Controls.Add($bClose)
+
+    $script:_apps = @()
+    function Update-Report {
+        $script:_apps = Find-AllApps
+        $lines = @()
+        $byKey = @{}
+        foreach ($a in $script:_apps) { $byKey[$a.key] = $a }
+        foreach ($meta in @(
+            @{k='blender'; n='Blender'},
+            @{k='maya';    n='Maya'},
+            @{k='sp';      n='Substance Painter'},
+            @{k='ue';      n='Unreal Engine'})) {
+            $a = $byKey[$meta.k]
+            if ($a) {
+                $st = if ($a.ok -eq $false) { '✗ 过低' } else { '✓ 可安装' }
+                $lines += ("{0,-18} {1,-10} 路径: {2}" -f $meta.n, ('v' + $a.version), $a.path)
+                $lines += ("   最低要求 >= {0}  [{1}]  -> {2}" -f $a.min, $st, $a.dst)
+                if ($a.note) { $lines += ("   注意: " + $a.note) }
+                if ($bInstall.ContainsKey($meta.k)) { $bInstall[$meta.k].Enabled = $a.ok }
+            } else {
+                $lines += ("{0,-18} 未检测到（可点下方『指定』按钮手动选择）" -f $meta.n)
+                if ($bInstall.ContainsKey($meta.k)) { $bInstall[$meta.k].Enabled = $false }
+            }
+            $lines += ''
+        }
+        if ($script:InstallSource) { $lines += ("当前安装源: $script:InstallSource") }
+        else { $lines += ("当前安装源: 本仓库 $ROOT/plugins") }
+        $report.Text = [string]::Join([Environment]::NewLine, $lines)
+    }
+
+    $bRefresh.add_Click({ Update-Report; $status.Text = '已重新检测' })
+    $bDl.add_Click({
+        $status.Text = '正在从 GitHub 下载...'
+        $msg = Get-PluginSourceFromGitHub
+        $status.Text = $msg
+        Update-Report
+    })
+    foreach ($k in @('blender','maya','sp','ue')) {
+        $bInstall[$k].add_Click({
+            param($sender,$e)
+            $key = $sender.Tag
+            $a = $script:_apps | Where-Object { $_.key -eq $key } | Select-Object -First 1
+            $status.Text = Install-App $a
+            Update-Report
+        })
+        $bManual[$k].add_Click({
+            param($sender,$e)
+            $key = $sender.Tag
+            $app = Request-ManualPath $key
+            if ($app) {
+                $status.Text = Install-App $app
+                Update-Report
+            }
+        })
+    }
+
+    Set-FormIcon $form
+    Update-Report
+    [void]$form.ShowDialog()
+}
+
+# ---- 自检定时器 -----------------------------------------------------------
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = $script:Interval * 1000
+$timer.add_Tick({
+    $up = Test-Server
+    $script:LastUp = $up
+    if (-not $up -and $script:Guard) {
+        Log '检测到服务未运行 -> 自动拉起'
+        Start-Server
+    }
+    Refresh-State
+})
+
+# 双击托盘图标 -> 状态窗
+$ni.add_DoubleClick({ Show-StatusWindow })
+
+# ---- 启动 ----------------------------------------------------------------
+Load-Config
+$timer.Interval = $script:Interval * 1000
+Log ('托盘启动 port={0} interval={1}' -f $script:Port, $script:Interval)
+
+Refresh-State
+if (-not $script:LastUp -and $script:Guard) {
+    Log '启动时服务未运行 -> 拉起'
+    Start-Server
+}
+$ni.Visible = $true
+$timer.Start()
+
+[System.Windows.Forms.Application]::Run()
+
+# 消息循环已结束（正常退出路径）：释放互斥量、删掉锁文件，避免下次起不来
+try { $mutex.ReleaseMutex() } catch { }
+try { $mutex.Dispose() } catch { }
+try { if (Test-Path $LOCKFILE) { Remove-Item $LOCKFILE -Force } } catch { }
+try { $ni.Visible = $false; $ni.Dispose() } catch { }

@@ -1,0 +1,5 @@
+﻿{
+    "port":  27631,
+    "interval":  10,
+    "payload_dir":  "E:\\CirnoWorkSpace\\AssetBridge\\runtime\\payloads"
+}

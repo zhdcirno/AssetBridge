@@ -1,0 +1,99 @@
+# -*- coding: utf-8 -*-
+"""
+Maya 启动脚本 —— 让 Maya 一打开就自动挂上 Asset Bridge。
+
+作用：注册到中转服务、开始轮询收件箱（自动接收模型）、
+并开一个 commandPort 供外部脚本远程驱动。
+
+**幂等**：重复执行是安全的（bridge.start() 会先 stop()），
+所以可以既放进启动脚本、又在需要时手动 exec 一次。
+
+--------------------------------------------------------------------------
+怎么装（本机实测环境）
+--------------------------------------------------------------------------
+本机 Maya 2023 用的是**中文界面**，用户目录是
+    C:/Users/12069/Documents/maya/2023/zh_CN/
+（prefs 都在 zh_CN/prefs 下），而且用户已经在
+    C:/Users/12069/Documents/maya/scripts/userSetup.py
+里放了自己的脚本病毒防护（vaccine）。
+
+⚠️ 关键约束：**Maya 只会执行 MAYA_SCRIPT_PATH 里找到的第一个
+userSetup.py**。所以绝不能往版本目录再塞一个同名文件——那可能把用户
+自己的 userSetup「顶掉」，让他的病毒防护静默失效。正确做法二选一：
+
+  A. 把本文件的启动代码**追加**到用户已有的 userSetup.py 末尾
+     （推荐，位置已被证实有效，且不产生同名文件竞争）；
+  B. 查明 MAYA_SCRIPT_PATH 的真实顺序后，装在**优先级最高**的那一层，
+     同时确保不会顶掉别人的 userSetup。
+
+安装前先用 tests/maya_commandport_verify.py 取一次诊断，
+里面会打印 MAYA_SCRIPT_PATH 的完整顺序，以及每个目录里有没有
+userSetup.py —— 有事实再动手，不要猜。
+
+--------------------------------------------------------------------------
+马上生效（不想重启 Maya 时）
+--------------------------------------------------------------------------
+在 Maya 的 Script Editor（Python 页签）里执行一行。**必须**带 encoding="utf-8"，
+否则中文 Windows 下 open() 默认用 GBK 解码本文件（含中文）会抛 UnicodeDecodeError：
+
+    exec(open(r"E:/CirnoWorkSpace/AssetBridge/maya/plugin/userSetup.py", encoding="utf-8").read())
+
+（路径用正斜杠，避免反斜杠转义坑。）
+
+成功的话 Maya 输出窗口会出现：
+    [bridge] Maya 适配器已启动
+    [bridge] commandPort 已开启: 127.0.0.1:7001 (python)
+
+之后外部就能用 tests/maya_commandport_verify.py 远程驱动它。
+
+--------------------------------------------------------------------------
+设计原则：**任何异常都不能让 Maya 起不来**
+--------------------------------------------------------------------------
+整段包在 try/except 里，中转服务没开也只警告一句，Maya 照常能用。
+"""
+import os
+import sys
+import traceback
+
+PLUGIN_DIR = r"E:\CirnoWorkSpace\AssetBridge\maya\plugin"
+
+# 用户如果要换工作区位置，改上面这行就行；也支持环境变量覆盖
+PLUGIN_DIR = os.environ.get("ASSET_BRIDGE_MAYA_PLUGIN", PLUGIN_DIR)
+
+
+def _bridge_boot():
+    if PLUGIN_DIR not in sys.path:
+        sys.path.insert(0, PLUGIN_DIR)
+    import maya.cmds as cmds
+
+    try:
+        import asset_bridge_maya as bridge
+    except Exception as exc:
+        cmds.warning("[bridge] 适配器导入失败，本次不启用：{0}".format(exc))
+        return
+
+    try:
+        bridge.start(
+            project=os.environ.get("ASSET_BRIDGE_PROJECT", ""),
+            auto_receive=True,
+        )
+    except Exception as exc:
+        cmds.warning("[bridge] 启动失败：{0}".format(exc))
+
+
+def main():
+    try:
+        import maya.utils
+
+        maya.utils.executeDeferred(_bridge_boot)
+    except Exception:
+        # 实在起不来也不能拖累 Maya 启动
+        try:
+            import maya.cmds as cmds
+
+            cmds.warning("[bridge] userSetup 异常：\n" + traceback.format_exc())
+        except Exception:
+            pass
+
+
+main()

@@ -1,0 +1,7 @@
+// Maya 2023 批量模式入口：用 mayabatch.exe -script 这个 MEL 执行，
+// 再由它把控制权交给 Python 脚本。
+// 之所以绕这一层：这台机器上 mayapy 的 standalone.pyd 加载失败
+// （DLL load failed），但完整的 Maya 批量进程是好的。
+python("import sys; sys.path.insert(0, r'E:/CirnoWorkSpace/AssetBridge/tests'); sys.stdout.write('MEL->PY OK\\n')");
+python("import runpy; runpy.run_path(r'E:/CirnoWorkSpace/AssetBridge/tests/maya2023_batch_main.py', run_name='__main__')");
+quit -f;
