@@ -10,7 +10,10 @@ __pycache__/
 Thumbs.db
 
 # ---- 用户本地工作工程（本机测试用，不进仓库）----
-unreal/
+# ⚠️ 必须写成 /unreal/（前导斜杠锚定仓库根）。裸模式 `unreal/` 会匹配任意层级
+# 的 unreal 目录，连 plugins/unreal/AssetBridge/（引擎级插件源）也一起忽略掉，
+# 导致 GitHub 上的安装器下载不到 UE 插件。
+/unreal/
 
 # ---- Python 虚拟环境 ----
 .venv/

@@ -1,0 +1,22 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0.0",
+    "FriendlyName": "Asset Bridge",
+    "Description": "跨 DCC 资产桥接插件：把 Blender / Maya / Substance Painter / 其他 UE 工程里的模型、贴图、Groom 毛发通过本地中转服务互传。引擎级插件，对所有使用本引擎版本的项目通用。",
+    "Category": "Workflow",
+    "CreatedBy": "AssetBridge",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "Installed": false,
+    "EnabledByDefault": true,
+    "Type": "Editor",
+    "LoadingPhase": "Default",
+    "Modules": [],
+    "Plugins": [
+        {
+            "Name": "PythonScriptPlugin",
+            "Enabled": true
+        }
+    ]
+}

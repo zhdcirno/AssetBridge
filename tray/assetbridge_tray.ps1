@@ -43,10 +43,12 @@ $LOCKFILE  = Join-Path $LOGDIR 'tray.lock'
 $ICONSRC   = Join-Path $ROOT 'assets\icons\png\16'   # 状态窗按钮用的小图标（16px）
 $APPICON   = Join-Path $ROOT 'assets\icons\ico\app_logo.ico'
 
-$ICON_OK     = Join-Path $ScriptDir 'icon_ok.ico'       # 绿：运行中
-$ICON_DOWN   = Join-Path $ScriptDir 'icon_down.ico'     # 红：已停止（守护已暂停，不会自动拉起）
-$ICON_WARN   = Join-Path $ScriptDir 'icon_warn.ico'     # 琥珀：掉线，守护会自动拉起
-$ICON_PAUSED = Join-Path $ScriptDir 'icon_paused.ico'   # 灰：运行中但守护被暂停
+# ⚠️ 图标实际位于 tray\icons\。之前只写 'icon_ok.ico' 会去找 tray\icon_ok.ico ->
+#    找不到 -> 退回系统图标，表现为「运行中(绿)显示成蓝色 i / 掉线显示成琥珀感叹号」。
+$ICON_OK     = Join-Path $ScriptDir 'icons\icon_ok.ico'       # 绿：运行中
+$ICON_DOWN   = Join-Path $ScriptDir 'icons\icon_down.ico'     # 红：已停止（守护已暂停，不会自动拉起）
+$ICON_WARN   = Join-Path $ScriptDir 'icons\icon_warn.ico'     # 琥珀：掉线，守护会自动拉起
+$ICON_PAUSED = Join-Path $ScriptDir 'icons\icon_paused.ico'   # 灰：运行中但守护被暂停
 # 图标来源：assets\icons\（由 tools\gen_icons.py 生成，可改配色后重新生成）
 
 # ---- 窗口图标（标题栏 + 任务栏）--------------------------------------------
@@ -232,11 +234,25 @@ function Open-Folder([string]$p) {
 
 # ---- 服务控制 -------------------------------------------------------------
 function Test-Server {
+    # 1) 首选 HTTP 健康检查（最权威：端口在监听且服务真的在响应 API）。
+    #    必须显式绕过系统代理——连 127.0.0.1 也会被代理劫成 502，导致误判「服务挂了」。
+    #    （之前只做裸 TCP BeginConnect，回调为 $null 时在某些环境下会一直超时 -> 永远判为掉线 -> 图标常驻感叹号）
+    try {
+        $req = [System.Net.WebRequest]::Create(('http://127.0.0.1:{0}/api/v1/config' -f $script:Port))
+        $req.Method   = 'GET'
+        $req.Timeout  = 1000
+        $req.Proxy    = $null
+        $resp = $req.GetResponse()
+        $resp.Close()
+        return $true
+    } catch { }
+
+    # 2) 兜底：裸 TCP 端口探测（服务可能没 HTTP 但端口在监听）
     $tcp = $null
     try {
         $tcp = New-Object System.Net.Sockets.TcpClient
         $ar = $tcp.BeginConnect('127.0.0.1', $script:Port, $null, $null)
-        $ok = $ar.AsyncWaitHandle.WaitOne(900, $false)
+        $ok = $ar.AsyncWaitHandle.WaitOne(1200, $false)
         if ($ok -and $tcp.Connected) { return $true }
         return $false
     } catch { return $false }
@@ -343,10 +359,15 @@ $script:IconCache = @{}          # 状态 -> @{ ts=文件时间戳; icon=Icon �
 function Apply-Icon([string]$state) {
     # 四态：ok=绿 / warn=琥珀 / paused=灰 / down=红（读不到文件时退回系统图标）
     switch ($state) {
-        'ok'     { $path = $ICON_OK;     $fb = [System.Drawing.SystemIcons]::Information }
-        'warn'   { $path = $ICON_WARN;   $fb = [System.Drawing.SystemIcons]::Warning }
-        'paused' { $path = $ICON_PAUSED; $fb = [System.Drawing.SystemIcons]::Shield }
-        default  { $path = $ICON_DOWN;   $fb = [System.Drawing.SystemIcons]::Error }
+        'ok'     { $path = $ICON_OK;     $alt = 'state_running.ico'; $fb = [System.Drawing.SystemIcons]::Information }
+        'warn'   { $path = $ICON_WARN;   $alt = 'state_recover.ico'; $fb = [System.Drawing.SystemIcons]::Warning }
+        'paused' { $path = $ICON_PAUSED; $alt = 'state_paused.ico';  $fb = [System.Drawing.SystemIcons]::Shield }
+        default  { $path = $ICON_DOWN;   $alt = 'state_stopped.ico'; $fb = [System.Drawing.SystemIcons]::Error }
+    }
+    # 回退：tray\icons\ 缺失时用 assets\icons\ico\state_*.ico；两处都没有才退回系统图标
+    if (-not (Test-Path $path)) {
+        $altPath = Join-Path (Join-Path $ROOT 'assets\icons\ico') $alt
+        if (Test-Path $altPath) { $path = $altPath }
     }
     # 按「文件修改时间」缓存：既不会每 10 秒重建 Icon（会泄漏 GDI 句柄），
     # 又能在磁盘上的图标被替换后自动换新的 —— 不用重启托盘。
