@@ -181,6 +181,9 @@ $script:Guard    = $true
 $script:LastUp   = $false
 $script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服务端 /api/v1/config 取
 $script:PidCache   = @{ pid = 0; ts = 0 }   # Get-ServerPid 的缓存（见该函数内的性能说明）
+# 手动指定的软件路径 { key -> exe / 引擎根目录 }，持久化在 tray_config.json 的 manual_paths。
+# 自动检测漏掉的软件（如装在非标准位置的 Maya）指定一次后就记住，刷新/重开安装器仍然认。
+$script:ManualPaths = @{}
 
 function Load-Config {
     if (Test-Path $CONFIG) {
@@ -189,13 +192,27 @@ function Load-Config {
             if ($c.port)     { $script:Port = [int]$c.port }
             if ($c.interval) { $script:Interval = [int]$c.interval }
             if ($c.payload_dir) { $script:PayloadDir = [string]$c.payload_dir }
+            if ($c.manual_paths) {
+                # 只认四个已知 key，脏配置不会带崩加载
+                foreach ($p in @($c.manual_paths.PSObject.Properties)) {
+                    $k = [string]$p.Name
+                    $v = [string]$p.Value
+                    if ($v -and ($AB_APPS_META | Where-Object { $_.k -eq $k })) { $script:ManualPaths[$k] = $v }
+                }
+            }
         } catch { Log ('读取配置失败: {0}' -f $_) }
     }
 }
 function Save-Config {
     try {
+        # payload_dir 为空时先问服务端要一个，别把空值写进配置
+        if (-not $script:PayloadDir) { $script:PayloadDir = Get-PayloadDir }
+        $mp = [ordered]@{}
+        foreach ($k in @($script:ManualPaths.Keys)) {
+            if ($AB_APPS_META | Where-Object { $_.k -eq $k }) { $mp[$k] = [string]$script:ManualPaths[$k] }
+        }
         ([ordered]@{ port = $script:Port; interval = $script:Interval;
-                     payload_dir = $script:PayloadDir } | ConvertTo-Json) |
+                     payload_dir = $script:PayloadDir; manual_paths = $mp } | ConvertTo-Json) |
             Out-File -Encoding utf8 $CONFIG
     } catch { Log ('写入配置失败: {0}' -f $_) }
 }
@@ -230,6 +247,40 @@ function Open-Folder([string]$p) {
     }
     Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $p)
     Log ('已打开目录 {0}' -f $p)
+}
+
+# 清空中转文件夹（payload dir）里的全部内容，保留目录本身。
+# 直接删、不停服务：服务只在收发瞬间短暂占用文件，删不掉的项目会计入失败数并进日志，
+# 避免了「停服->清理->拉起」把设置窗卡住好几秒、还可能把别处起的服务换成的尴尬。
+function Clear-PayloadDir([string]$dir) {
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Get-PayloadDir }
+    if ([string]::IsNullOrWhiteSpace($dir)) { return '未找到中转目录' }
+    if (-not (Test-Path -LiteralPath $dir)) { return '中转目录不存在，无需清理' }
+    $items = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)
+    if ($items.Count -eq 0) { return '中转目录已经是空的' }
+    # 先统计体积，好在结果里告诉用户释放了多少空间
+    $bytes = 0L
+    foreach ($i in $items) {
+        try {
+            if ($i.PSIsContainer) {
+                $bytes += [int64](Get-ChildItem -LiteralPath $i.FullName -Recurse -Force -File -ErrorAction SilentlyContinue |
+                                  Measure-Object -Property Length -Sum).Sum
+            } else { $bytes += [int64]$i.Length }
+        } catch { }
+    }
+    $n = 0; $fail = 0
+    foreach ($i in $items) {
+        try {
+            Remove-Item -LiteralPath $i.FullName -Recurse -Force -ErrorAction Stop
+            $n++
+        } catch {
+            $fail++
+            Log ('清空中转目录: 删除失败 {0} -> {1}' -f $i.FullName, $_.Exception.Message)
+        }
+    }
+    $msg = ('已清空中转目录：删除 {0} 项，释放 {1} MB（{2}）' -f $n, [math]::Round($bytes / 1MB, 1), $dir)
+    if ($fail -gt 0) { $msg += ('；{0} 项删除失败（可能被占用），详见日志' -f $fail) }
+    return $msg
 }
 
 # ---- 服务控制 -------------------------------------------------------------
@@ -559,7 +610,7 @@ function Show-StatusWindow {
 function Show-Settings {
     $d = New-Object System.Windows.Forms.Form
     $d.Text          = 'Asset Bridge 设置'
-    $d.ClientSize    = New-Object System.Drawing.Size(400, 210)
+    $d.ClientSize    = New-Object System.Drawing.Size(400, 244)
     $d.StartPosition = 'CenterParent'
     $d.FormBorderStyle = 'FixedDialog'
     $d.MaximizeBox   = $false
@@ -585,13 +636,46 @@ function Show-Settings {
     $ob.add_Click({ Open-Folder ([string]$t3.Text) })
     $d.Controls.Add($ob)
 
+    # 清空中转文件夹：确认后删掉该目录下全部内容（保留目录本身）
+    $cb = New-Object System.Windows.Forms.Button
+    $cb.Text = '清空'; $cb.SetBounds(302, 117, 84, 26)
+    $cb.add_Click({
+        try {
+            $dir = ([string]$t3.Text).Trim()
+            if ([string]::IsNullOrWhiteSpace($dir)) { $dir = Get-PayloadDir; $t3.Text = $dir }
+            if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path -LiteralPath $dir)) {
+                [System.Windows.Forms.MessageBox]::Show(('中转目录不存在：{0}' -f $dir), 'Asset Bridge') | Out-Null
+                return
+            }
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                ('确定清空中转文件夹吗？' + "`n`n" + $dir +
+                 "`n`n该目录下所有互传中的模型/贴图文件都会被删除（传输历史记录仍保留，不影响已安装的插件）。" +
+                 "`n建议确认没有正在进行的收发后再操作。"),
+                '确认清空', 'YesNo', 'Warning')
+            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+            $msg = Clear-PayloadDir $dir
+            Log ('设置: ' + $msg)
+            [System.Windows.Forms.MessageBox]::Show($msg, 'Asset Bridge') | Out-Null
+        } catch {
+            # 单个按钮出错不该把整个托盘崩掉（全局 ThreadException 之外的近距离兜底）
+            try { Log ('设置: 清空中转目录出错 -> ' + $_.Exception.Message) } catch { }
+            [System.Windows.Forms.MessageBox]::Show(('清空失败：{0}' -f $_.Exception.Message), 'Asset Bridge') | Out-Null
+        }
+    })
+    $d.Controls.Add($cb)
+
     $hint = New-Object System.Windows.Forms.Label
     $hint.Text = '该目录存放各软件互传的模型/贴图，由中转服务管理'
     $hint.ForeColor = [System.Drawing.Color]::Gray
-    $hint.SetBounds(112, 118, 274, 18); $d.Controls.Add($hint)
+    $hint.SetBounds(112, 146, 274, 18); $d.Controls.Add($hint)
+
+    $hint2 = New-Object System.Windows.Forms.Label
+    $hint2.Text = '「清空」会删除目录内全部文件（不影响已安装的插件）'
+    $hint2.ForeColor = [System.Drawing.Color]::Gray
+    $hint2.SetBounds(112, 166, 274, 18); $d.Controls.Add($hint2)
 
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = '确定'; $ok.SetBounds(112, 152, 88, 30)
+    $ok.Text = '确定'; $ok.SetBounds(112, 192, 88, 30)
     $ok.add_Click({
         try {
             $np = [int]$t1.Text
@@ -613,7 +697,7 @@ function Show-Settings {
     $d.Controls.Add($ok)
 
     $ca = New-Object System.Windows.Forms.Button
-    $ca.Text = '取消'; $ca.SetBounds(214, 152, 88, 30)
+    $ca.Text = '取消'; $ca.SetBounds(214, 192, 88, 30)
     $ca.add_Click({ $d.Close() })
     $d.Controls.Add($ca)
 
@@ -1160,17 +1244,36 @@ function Find-Unreal {
     }
 }
 function Find-AllApps {
-    $all = @()
+    $det = @()
     foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal')) {
         try {
             $r = & $fn
-            if ($r) { $all += $r }
+            if ($r) { $det += $r }
         } catch {
             # 单个检测器出错不该拖垮整个安装器：记日志 + 跳过该软件，其余照常展示
             Log ("安装器: 检测 $fn 失败 -> " + $_.Exception.Message)
         }
     }
-    return $all
+    # 与「手动指定的路径」（持久化于 tray_config.json -> manual_paths）合并：
+    # 自动检测漏掉的软件，指定过一次就一路可用。
+    $out = @()
+    foreach ($meta in $AB_APPS_META) {
+        $auto = $null
+        foreach ($a in $det) { if ($a.key -eq $meta.k) { $auto = $a; break } }
+        $man = $null
+        if ($script:ManualPaths.ContainsKey($meta.k)) {
+            try {
+                $man = Resolve-ManualApp $meta.k ([string]$script:ManualPaths[$meta.k])
+            } catch {
+                Log ("安装器: 解析手动指定路径失败 $($meta.k) -> " + $_.Exception.Message)
+                $man = $null
+            }
+        }
+        if ($auto -and $man) { $out += (Merge-AppResults $auto $man) }
+        elseif ($auto) { $out += $auto }
+        elseif ($man)  { $out += $man }
+    }
+    return $out
 }
 function Copy-Plugin([string]$src, [string]$dst, [string]$label, $app) {
     try {
@@ -1237,115 +1340,194 @@ function Get-PluginSourceFromGitHub {
         return "下载失败: $_"
     }
 }
+# 把「手动指定的路径」解析成与 Find-* 同结构的应用对象。
+#   - 路径可用且版本达标 -> ok=$true
+#   - 路径存在但版本过低/读不到版本 -> ok=$false + note 写明原因
+#   - 路径根本不是有效安装 -> $null
+# 纯函数、不弹窗：Request-ManualPath（用户刚选完，要弹提示）和 Find-AllApps
+# （每次刷新都跑，绝不能弹窗）共用它。
+function Resolve-ManualApp([string]$key, [string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+    $path = $path.Trim().Trim('"')
+    $src = ''
+    switch ($key) {
+        'blender' { $src = 'plugins/blender/asset_bridge_blender' }
+        'maya'    { $src = 'plugins/maya/asset_bridge_maya' }
+        'sp'      { $src = 'plugins/substance_painter/asset-bridge' }
+        'ue'      { $src = 'plugins/unreal/AssetBridge' }
+        default   { return $null }
+    }
+    # 允许直接给安装目录：替他找目录下的可执行文件
+    if (Test-Path -LiteralPath $path -PathType Container) {
+        $leaf = switch ($key) {
+            'blender' { 'blender.exe' }
+            'maya'    { 'maya.exe' }
+            'sp'      { 'Adobe Substance 3D Painter.exe' }
+            default   { '' }
+        }
+        if ($leaf) {
+            $hit = $null
+            foreach ($t in @((Join-Path $path $leaf), (Join-Path $path "bin\$leaf"))) {
+                if (Test-Path -LiteralPath $t -PathType Leaf) { $hit = (Resolve-Path -LiteralPath $t).Path; break }
+            }
+            if (-not $hit) { return $null }
+            $path = $hit
+        }
+    }
+    switch ($key) {
+        'blender' {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'blender.exe') { return $null }
+            $ver = ''
+            $parent = Split-Path $path
+            if ($parent -match '(\d+\.\d+(?:\.\d+)?)') { $ver = $Matches[1] }
+            if (-not $ver) { $ver = Get-ExeVer $path }
+            $ok = ($ver -and (Ver-GE $ver $MIN_BLENDER))
+            $note = if ($ok) { '' } else { "版本过低或无法识别（需 >= $MIN_BLENDER）" }
+            $mm = ''
+            if ($ver) { $mm = ($ver -split '\.')[0..1] -join '.' }
+            return [PSCustomObject]@{
+                key='blender'; name='Blender'; version=$ver; path=$path; min=$MIN_BLENDER;
+                src=$src; ok=$ok; note=$note;
+                targets=@("$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender")
+            }
+        }
+        'maya' {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'maya.exe') { return $null }
+            $ver = ''
+            if ($path -match 'Maya[_ ]?(\d{4})') { $ver = $Matches[1] }
+            if (-not $ver) { $ver = Convert-MayaYear (Get-ExeVer $path) }
+            $ok = ($ver -and (Ver-GE $ver $MIN_MAYA))
+            $note = if ($ok) { '' } else { "版本过低或无法识别（需 >= $MIN_MAYA）" }
+            return [PSCustomObject]@{
+                key='maya'; name='Maya'; version=$ver; path=$path; min=$MIN_MAYA;
+                src=$src; ok=$ok; note=$note;
+                targets=@("$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya")
+            }
+        }
+        'sp' {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+            $vi = Get-ExeVerAll $path
+            $pv = $vi.pv; $build = 0
+            $parts = @($vi.fv -split '\.')
+            if ($parts.Count -ge 4) { [void][int]::TryParse($parts[3], [ref]$build) }
+            $ok = $false; $note = ''
+            if (-not $pv) { $note = '无法读取版本信息' }
+            elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
+            elseif ($build -gt 0 -and $build -lt $MIN_SP_BUILD) { $note = "构建号过低（需 >= build $MIN_SP_BUILD，检测到 build $build）" }
+            else {
+                $ok = $true
+                if ($build -eq 0) { $note = "该安装未在程序里写构建号，按版本 $pv 判定（要求 >= $MIN_SP build $MIN_SP_BUILD）" }
+            }
+            $verText = $pv
+            if ($build -gt 0) { $verText = "$pv (build $build)" }
+            return [PSCustomObject]@{
+                key='sp'; name='Substance Painter'; version=$verText; path=$path; min="$MIN_SP (build $MIN_SP_BUILD)";
+                src=$src; ok=$ok; note=$note;
+                targets=@("$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge")
+            }
+        }
+        'ue' {
+            # UE 记的是引擎根目录（targets 由根目录推导）
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) { return $null }
+            $ed = Join-Path $path 'Engine\Binaries\Win64\UnrealEditor.exe'
+            if (-not (Test-Path -LiteralPath $ed -PathType Leaf)) { return $null }
+            $ver = ''
+            $bv = Join-Path $path 'Engine\Build\Build.version'
+            if (Test-Path $bv) {
+                try {
+                    $j = Get-Content $bv -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $ver = "$($j.MajorVersion).$($j.MinorVersion)"
+                } catch { }
+            }
+            if (-not $ver -and ($path -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
+            $ok = ($ver -and (Ver-GE $ver $MIN_UE))
+            $note = if ($ok) { '' } else { "版本过低或无法识别（需 >= $MIN_UE）" }
+            return [PSCustomObject]@{
+                key='ue'; name='Unreal Engine'; version=$ver; path=$ed; min=$MIN_UE;
+                src=$src; ok=$ok; note=$note;
+                targets=@(Join-Path $path 'Engine\Plugins\AssetBridge')
+            }
+        }
+    }
+    return $null
+}
+
+# 合并「自动检测结果」与「手动指定结果」：
+#  - 只有一边有效 -> 用那一边
+#  - 两边都有效 -> targets / 版本 / 路径取并集（检测到 5.0、手动指定 5.2 时两个版本都装）
+#  - 两边都无效 -> 以自动检测的说明为主（它有更全的上下文）
+function Merge-AppResults($auto, $man) {
+    if (-not $auto) { return $man }
+    if (-not $man)  { return $auto }
+    if ($man.ok -and -not $auto.ok) { return $man }
+    if (-not $man.ok) { return $auto }
+    $tg = @()
+    foreach ($t in (@($auto.targets) + @($man.targets))) { if ($t -and ($tg -notcontains $t)) { $tg += $t } }
+    $vers = @()
+    foreach ($v in @($auto.version, $man.version)) {
+        foreach ($one in @($v -split ',')) { $one = $one.Trim(); if ($one -and ($vers -notcontains $one)) { $vers += $one } }
+    }
+    $paths = @()
+    foreach ($p in @($auto.path, $man.path)) { if ($p -and ($paths -notcontains $p)) { $paths += $p } }
+    $notes = @()
+    foreach ($n in @($auto.note, $man.note)) { if ($n -and ($notes -notcontains $n)) { $notes += $n } }
+    return [PSCustomObject]@{
+        key=$auto.key; name=$auto.name; version=($vers -join ','); path=($paths -join ' ; ');
+        min=$auto.min; src=$auto.src; targets=$tg; ok=$true; note=($notes -join '；')
+    }
+}
+
 function Request-ManualPath([string]$key) {
-    # 未自动检测到时，让用户手动指定软件路径；返回与 Find-* 同结构的对象，或 $null
-    $app = $null
+    # 未自动检测到时，让用户手动指定软件路径；返回与 Find-* 同结构的对象，或 $null。
+    # 指定成功后会写进 tray_config.json（manual_paths）——以后刷新/重开安装器都认。
+    $path = $null
     switch ($key) {
         'blender' {
             $ofd = New-Object System.Windows.Forms.OpenFileDialog
             $ofd.Filter = 'Blender 可执行文件|blender.exe'
             $ofd.Title  = '选择 blender.exe'
-            if ($ofd.ShowDialog() -eq 'OK') {
-                $exe = $ofd.FileName
-                $ver = ''
-                $parent = Split-Path $exe
-                if ($parent -match '(\d+\.\d+(?:\.\d+)?)') { $ver = $Matches[1] }
-                if (-not $ver) { $ver = Get-ExeVer $exe }
-                if ($ver -and (Ver-GE $ver $MIN_BLENDER)) {
-                    $mm = ($ver -split '\.')[0..1] -join '.'
-                    $app = [PSCustomObject]@{
-                        key='blender'; name='Blender'; version=$ver; path=$exe; min=$MIN_BLENDER;
-                        src = 'plugins/blender/asset_bridge_blender'; ok=$true; note='';
-                        targets = @("$(Join-Path $env:APPDATA 'Blender Foundation')\Blender\$mm\scripts\addons\asset_bridge_blender")
-                    }
-                } else {
-                    [System.Windows.Forms.MessageBox]::Show("该 Blender 版本过低或无法识别（需 >= $MIN_BLENDER）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
-                }
-            }
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
         }
         'maya' {
             $ofd = New-Object System.Windows.Forms.OpenFileDialog
             $ofd.Filter = 'Maya 可执行文件|maya.exe'
             $ofd.Title  = '选择 maya.exe'
-            if ($ofd.ShowDialog() -eq 'OK') {
-                $exe = $ofd.FileName
-                $ver = ''
-                if ($exe -match 'Maya[_ ]?(\d{4})') { $ver = $Matches[1] }
-                if (-not $ver) { $ver = Convert-MayaYear (Get-ExeVer $exe) }
-                if ($ver -and (Ver-GE $ver $MIN_MAYA)) {
-                    $app = [PSCustomObject]@{
-                        key='maya'; name='Maya'; version=$ver; path=$exe; min=$MIN_MAYA;
-                        src = 'plugins/maya/asset_bridge_maya'; ok=$true; note='';
-                        targets = @("$(Join-Path $env:USERPROFILE 'Documents')\maya\$ver\zh_CN\scripts\asset_bridge_maya")
-                    }
-                } else {
-                    [System.Windows.Forms.MessageBox]::Show("该 Maya 版本过低或无法识别（需 >= $MIN_MAYA）。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
-                }
-            }
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
         }
         'sp' {
             $ofd = New-Object System.Windows.Forms.OpenFileDialog
             $ofd.Filter = 'Substance 3D Painter|*.exe'
             $ofd.Title  = '选择 Substance 3D Painter.exe'
-            if ($ofd.ShowDialog() -eq 'OK') {
-                $exe = $ofd.FileName
-                $vi = Get-ExeVerAll $exe
-                $pv = $vi.pv; $build = 0
-                $parts = @($vi.fv -split '\.')
-                if ($parts.Count -ge 4) { [void][int]::TryParse($parts[3], [ref]$build) }
-                $ok = $false; $note = ''
-                if (-not $pv) { $note = '无法读取版本信息' }
-                elseif (-not (Ver-GE $pv $MIN_SP)) { $note = "版本过低（需 >= $MIN_SP）" }
-                elseif ($build -gt 0 -and $build -lt $MIN_SP_BUILD) { $note = "构建号过低（需 >= build $MIN_SP_BUILD，检测到 build $build）" }
-                else {
-                    $ok = $true
-                    if ($build -eq 0) { $note = "该安装未在程序里写构建号，按版本 $pv 判定（要求 >= $MIN_SP build $MIN_SP_BUILD）" }
-                }
-                if ($ok) {
-                    $verText = $pv
-                    if ($build -gt 0) { $verText = "$pv (build $build)" }
-                    $app = [PSCustomObject]@{
-                        key='sp'; name='Substance Painter'; version=$verText; path=$exe; min="$MIN_SP (build $MIN_SP_BUILD)";
-                        src = 'plugins/substance_painter/asset-bridge'; ok=$true; note=$note;
-                        targets = @("$(Join-Path $env:USERPROFILE 'Documents')\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge")
-                    }
-                } else {
-                    [System.Windows.Forms.MessageBox]::Show("该 Substance Painter $note。`n路径: $exe", '版本不符', 'OK', 'Warning') | Out-Null
-                }
-            }
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
         }
         'ue' {
             $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
             $fbd.Description = '选择 Unreal Engine 安装根目录（需包含 Engine\Binaries\Win64\UnrealEditor.exe）'
             $fbd.ShowNewFolderButton = $false
-            if ($fbd.ShowDialog() -eq 'OK') {
-                $root = $fbd.SelectedPath
-                $ed = Join-Path $root 'Engine\Binaries\Win64\UnrealEditor.exe'
-                if (-not (Test-Path $ed)) {
-                    [System.Windows.Forms.MessageBox]::Show("该目录不是 Unreal Engine 根目录`n（未找到 Engine\Binaries\Win64\UnrealEditor.exe）", '路径无效', 'OK', 'Warning') | Out-Null
-                } else {
-                    $ver = ''
-                    $bv = Join-Path $root 'Engine\Build\Build.version'
-                    if (Test-Path $bv) {
-                        try {
-                            $j = Get-Content $bv -Raw -Encoding UTF8 | ConvertFrom-Json
-                            $ver = "$($j.MajorVersion).$($j.MinorVersion)"
-                        } catch { }
-                    }
-                    if (-not $ver -and ($root -match '(\d+\.\d+(?:\.\d+)?)')) { $ver = $Matches[1] }
-                    if ($ver -and (Ver-GE $ver $MIN_UE)) {
-                        $app = [PSCustomObject]@{
-                            key='ue'; name='Unreal Engine'; version=$ver; path=$ed; min=$MIN_UE;
-                            src = 'plugins/unreal/AssetBridge'; ok=$true; note='';
-                            targets = @(Join-Path $root 'Engine\Plugins\AssetBridge')
-                        }
-                    } else {
-                        [System.Windows.Forms.MessageBox]::Show("该 Unreal Engine 版本过低或无法识别（需 >= $MIN_UE）。`n根目录: $root", '版本不符', 'OK', 'Warning') | Out-Null
-                    }
-                }
-            }
+            if ($fbd.ShowDialog() -eq 'OK') { $path = $fbd.SelectedPath }
         }
     }
+    if (-not $path) { return $null }
+    $app = Resolve-ManualApp $key $path
+    if (-not $app) {
+        [System.Windows.Forms.MessageBox]::Show(
+            ('路径无效：未能在该路径找到有效的程序。' + "`n" + $path +
+             "`n`nBlender / Maya / Substance Painter 请选择对应的 .exe；UE 请选择引擎根目录。"),
+            '路径无效', 'OK', 'Warning') | Out-Null
+        return $null
+    }
+    if (-not $app.ok) {
+        [System.Windows.Forms.MessageBox]::Show(
+            ('该 {0} {1}。' -f $app.name, $app.note) + "`n" + ('路径: {0}' -f $path),
+            '版本不符', 'OK', 'Warning') | Out-Null
+        return $null
+    }
+    # 记住这次手动指定（持久化），之后 Find-AllApps 每次都会带上它
+    $script:ManualPaths[$key] = $path
+    try { Save-Config } catch { Log ('保存手动路径失败: {0}' -f $_) }
+    Log ('安装器: 已记住手动指定路径 {0} -> {1}' -f $key, $path)
     return $app
 }
 
@@ -1380,6 +1562,9 @@ function Update-InstallerUI {
         if ($a.path) { $lines += ("   程序: " + $a.path) }
         $lines += ("   最低要求 >= " + $a.min)
         if ($a.note) { $lines += ("   注意: " + $a.note) }
+        if ($script:ManualPaths.ContainsKey($meta.k)) {
+            $lines += ("   手动指定: " + $script:ManualPaths[$meta.k] + "（已记住，刷新后仍生效）")
+        }
         foreach ($t in @($a.targets)) { $lines += ("   安装到: " + $t) }
         if ($ib) {
             $ib.Enabled = [bool]$a.ok
@@ -1487,28 +1672,43 @@ function Show-Installer {
     foreach ($meta in $AB_APPS_META) {
         $bInstall[$meta.k].add_Click({
             param($sender, $e)
-            $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
-            if (-not $a) { $script:IStatus.Text = '未检测到该软件，请用「指定」按钮手动选择路径'; return }
-            $script:IStatus.Text = (Install-App $a)
-            Update-InstallerUI
+            try {
+                $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
+                if (-not $a) { $script:IStatus.Text = '未检测到该软件，请用「指定」按钮手动选择路径'; return }
+                $script:IStatus.Text = (Install-App $a)
+                Update-InstallerUI
+            } catch {
+                $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
+                Log ('安装器: 安装事件出错 -> ' + $_.Exception.Message)
+            }
         })
         $bUninstall[$meta.k].add_Click({
             param($sender, $e)
-            $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
-            if (-not $a) { return }
-            $r = [System.Windows.Forms.MessageBox]::Show(
-                ("确定卸载 " + $a.name + " 的 Asset Bridge 插件吗？`n`n将从以下位置移除（会先备份到 backups/，可回滚）：`n" + (@($a.targets) -join "`n")),
-                '确认卸载', 'YesNo', 'Warning')
-            if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-            $script:IStatus.Text = (Uninstall-App $a)
-            Update-InstallerUI
+            try {
+                $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
+                if (-not $a) { return }
+                $r = [System.Windows.Forms.MessageBox]::Show(
+                    ("确定卸载 " + $a.name + " 的 Asset Bridge 插件吗？`n`n将从以下位置移除（会先备份到 backups/，可回滚）：`n" + (@($a.targets) -join "`n")),
+                    '确认卸载', 'YesNo', 'Warning')
+                if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+                $script:IStatus.Text = (Uninstall-App $a)
+                Update-InstallerUI
+            } catch {
+                $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
+                Log ('安装器: 卸载事件出错 -> ' + $_.Exception.Message)
+            }
         })
         $bManual[$meta.k].add_Click({
             param($sender, $e)
-            $app = Request-ManualPath $sender.Tag
-            if ($app) {
-                $script:IStatus.Text = (Install-App $app)
-                Update-InstallerUI
+            try {
+                $app = Request-ManualPath $sender.Tag
+                if ($app) {
+                    $script:IStatus.Text = (Install-App $app)
+                    Update-InstallerUI
+                }
+            } catch {
+                $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
+                Log ('安装器: 指定路径事件出错 -> ' + $_.Exception.Message)
             }
         })
     }
