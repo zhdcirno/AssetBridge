@@ -354,15 +354,17 @@ abu.send_selected_assets("blender")
 > 需要 **ZBrush 2026.1 或更高**（Python API 是 2026.0 才有的；2025.x 只有 ZScript，用不了）。
 > 2026.1 起 ZBrush 安装目录只读，插件装在**用户资产目录**（`%APPDATA%\Maxon\Zbrush<版本>_<哈希>\ZStartup\ZPlugs64\`）。
 
-**安装**：托盘 → 安装插件 → ZBrush 行点 **安装**。安装器会做三件事：拷插件到用户 ZStartup、写运行配置、往 `ZData\Python\init.py` 注入自动加载钩子。**重启 ZBrush** 后自动出现 `Zplugin → AssetBridge` 面板，桥接自动开始运行（左上角 note bar 有提示）。
+**安装**：托盘 → 安装插件 → ZBrush 行点 **安装**。安装器会做三件事：拷插件到用户 ZStartup、写运行配置、往 `ZData\Python\init.py` 注入自动加载钩子。**重启 ZBrush** 后自动出现 `Zplugin → AssetBridge` 面板（观察线程已在后台运行，不会卡界面；待收任务数写在 `<中转目录>\bridge_status.json`）。
 （万一 init.py 注入失败：ZScript 面板 → Python 子面板 → Load Script，选用户 ZStartup\ZPlugs64\asset_bridge_zbrush\asset_bridge_zbrush.py，效果一样。）
 
-**接收模型（其他软件 → ZBrush）——全自动**：在 Blender / Maya / UE / SP / Toolbag 里把模型发往 **ZBrush**。ZBrush 桥接在运行时自动导入（免对话框）。
-特殊情况：ZBrush 开着但桥接没启动（比如刚 Load 完脚本）时，模型会先落盘，托盘弹气泡告诉你文件路径（点气泡复制路径，或右键托盘「复制最近一次 ZBrush 接收路径」），然后在 ZBrush 里 `Tool → Load` 手动加载即可。
+**接收模型（其他软件 → ZBrush）——一键导入**：在 Blender / Maya / UE / SP / Toolbag 里把模型发往 **ZBrush**，然后在 ZBrush 里点 `Zplugin → AssetBridge → 导入待收模型`（主线程执行、免对话框、有超时保护，不会挂起）。
+特殊情况：ZBrush 未运行时守护进程会自动拉起 ZBrush 一次性导入；ZBrush 开着但适配器没加载（比如没重启）时，模型会先落盘，托盘弹气泡告诉你文件路径（点气泡复制路径，或右键托盘「复制最近一次 ZBrush 接收路径」），然后在 ZBrush 里 `Tool → Load` 手动加载即可。
 
 **发送模型（ZBrush → 其他软件）——手动触发**：ZBrush 里选中要发的工具（SubTool），点 `Zplugin → AssetBridge → 发送当前模型`（默认发往 Blender；想发回最近一次给你发模型的软件，点「发送回最近发送者」）。导出免对话框，发完 note bar 有提示，对方软件自动导入/重载。
 
-**热文件夹兜底**：不想用按钮，也可以在 ZBrush 里手动导出 OBJ 到 `<中转目录>\zbrush_outbox\`，编辑器守护会自动把它回传给 Blender（目标可在 `tools\editor_daemon.json` 的 `zbrush_outbox_to` 改）。
+**热文件夹兜底**：不想用按钮，也可以在 ZBrush 里手动导出 OBJ 到 `<中转目录>\zbrush_outbox\`，再点「立即回传热文件夹」，或等编辑器守护自动回传（目标可在 `tools\editor_daemon.json` 的 `zbrush_outbox_to` 改）。
+
+**自动导入（实验功能，默认关闭）**：点 `自动导入` 可开启主线程轮询导入——注意这会让 ZBrush 周期性卡顿（ZBrush 的 Python 只能在主线程干活，这是官方 API 的硬限制），随时再点一次停止，单圈超过 60 秒也会自动停。日常用「导入待收模型」按钮即可，无卡顿。
 
 > ⚠️ ZBrush **没有「保存后自动回传」**（没有保存事件钩子），发送一律是手动触发——按钮或热文件夹，二选一。
 > ⚠️ 高模先 Decimation 再发，OBJ 动辄几百 MB。

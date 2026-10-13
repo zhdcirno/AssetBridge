@@ -88,11 +88,33 @@ function Set-FormIcon([System.Windows.Forms.Form]$form) {
 }
 
 function Log([string]$m) {
+    # 异步日志：只入队，由 Flush-Log（500ms 定时器）批量落盘。
+    # UI 线程里同步写文件会卡消息循环（尤其是日志量大时）。
     $line = ('{0} [tray] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
     try {
-        if (-not (Test-Path $LOGDIR)) { New-Item -ItemType Directory -Path $LOGDIR -Force | Out-Null }
-        $line | Out-File -Append -Encoding utf8 $LOG
+        if (-not $script:LogQueue) { $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new() }
+        $script:LogQueue.Enqueue($line)
+        # 刷写定时器还没就绪（启动初期）-> 直接写，不丢日志
+        if (-not $script:LogTimerReady) {
+            try {
+                if (-not (Test-Path $LOGDIR)) { New-Item -ItemType Directory -Path $LOGDIR -Force | Out-Null }
+                Add-Content -Path $LOG -Value $line -Encoding utf8
+            } catch { }
+        }
     } catch { }
+}
+function Flush-Log {
+    # 批量把队列写进文件（UI 定时器调用；退出时也会兜底调用一次）
+    if (-not $script:LogQueue) { return }
+    $line = ''
+    $n = 0
+    while ($n -lt 500 -and $script:LogQueue.TryDequeue([ref]$line)) {
+        try {
+            if (-not (Test-Path $LOGDIR)) { New-Item -ItemType Directory -Path $LOGDIR -Force | Out-Null }
+            Add-Content -Path $LOG -Value $line -Encoding utf8
+        } catch { }
+        $n++
+    }
 }
 
 function Get-AbImage([string]$file, [string]$src = $ICONSRC) {
@@ -138,12 +160,14 @@ trap {
     break
 }
 
+# 单实例保护（冒烟测试用 ASSETBRIDGE_SMOKE=1 旁路：真实托盘在跑时也能验证启动路径）
+$script:ReallyExit = $false
+if ($env:ASSETBRIDGE_SMOKE -ne '1') {
 # ---- 单实例保护 -----------------------------------------------------------
 # 互斥量 + PID 锁文件双保险：
 # 互斥量只说明"曾经有人持有着"，但旧实例若没正常退出（比如被 FormClosing 卡住），
 # 它会一直存在，于是新实例永远起不来。所以还要用锁文件里的 PID 复核一下：
 # 那个进程已经不在了 -> 判定为残留，本次接管。
-$script:ReallyExit = $false
 $createdNew = $false
 $mutex = New-Object System.Threading.Mutex($true, 'Global\AssetBridgeTraySingleton', [ref]$createdNew)
 if (-not $createdNew) {
@@ -162,11 +186,22 @@ if (-not $createdNew) {
     Log ('发现残留的互斥量（旧 pid 已不存在）-> 本次接管')
 }
 try { Set-Content -Path $LOCKFILE -Value $PID -Encoding ascii } catch { }
+}
 
 function Exit-Tray {
     # 真正退出：必须先置位，否则状态窗的 FormClosing 会把关闭动作取消掉，
     # 导致 Application.Exit() 无效、进程永远退不出去（图标已隐藏 => 看起来像退了）。
     $script:ReallyExit = $true
+    # 后台任务与日志队列先收尾（退出前把日志落盘，避免丢最后几条）
+    try { Stop-BgTasks } catch { }
+    try {
+        if ($logTimer -ne $null) { $logTimer.Stop() }
+        if ($bgTimer  -ne $null) { $bgTimer.Stop() }
+    } catch { }
+    try { Flush-Log } catch { }
+    if ($script:WorkerSlice -and (Test-Path $script:WorkerSlice)) {
+        try { Remove-Item $script:WorkerSlice -Force -ErrorAction SilentlyContinue } catch { }
+    }
     try { if ($script:Form -ne $null) { $script:Form.Dispose() } } catch { }
     try { $ni.Visible = $false } catch { }
     try { $mutex.ReleaseMutex() } catch { }
@@ -187,6 +222,141 @@ $script:Guard    = $true
 $script:LastUp   = $false
 $script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服务端 /api/v1/config 取
 $script:AbNotifyPath = ''  # D3：最近一次 ZBrush 接收的文件路径（气泡点击/菜单复制用）
+
+# ---- 后台任务基础设施（UI 线程永不阻塞） -----------------------------------
+# 原则：点击事件/定时器 tick 里**只启动任务、不等待**；网络、进程、磁盘扫描全部
+# 在独立 runspace 里跑，完成后由 $bgTimer（150ms）把结果投回 UI 线程执行回调。
+$script:BgJobs       = @{}     # tag -> @{ ps; handle; onDone; started; timeout }
+$script:BgPool       = $null
+$script:WorkerSlice  = ''
+$script:LogTimerReady = $false
+
+function Get-WorkerSlice {
+    # 生成「常量 + 全部函数」切片供后台 runspace dot-source。
+    # 做法：head（截到单实例检查之前，避开互斥量/exit）+ AST EndBlock 的**顶层**
+    #      函数定义与变量赋值（EndBlock.Statements 只含顶层语句，绝不混入函数体）。
+    # 路径常量（$ROOT/$ScriptDir/...）由 Start-BgTask 在 dot-source 后注入正确值
+    #（runspace 里 $MyInvocation 指向切片文件，不能信切片里的推导）。
+    if ($script:WorkerSlice -and (Test-Path $script:WorkerSlice)) { return $script:WorkerSlice }
+    try {
+        $src = [System.IO.File]::ReadAllText($PSCommandPath, [System.Text.Encoding]::UTF8)
+        $tokens = $null; $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errs)
+        $sb = New-Object System.Text.StringBuilder
+        $cut = $src.IndexOf('$script:ReallyExit = $false')
+        if ($cut -gt 0) { [void]$sb.Append($src.Substring(0, $cut)) }
+        foreach ($n in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine($n.Extent.Text)
+        }
+        # 顶层赋值只从 EndBlock.Statements 取（曾用 Parent 过滤，函数体内的 $pid=0 会泄漏，
+        # 在 runspace 里覆盖只读变量 $PID 直接炸——ParseFile 完全看不出来）
+        foreach ($st in $ast.EndBlock.Statements) {
+            if ($st -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+            $t = $st.Extent.Text
+            if ($t -match 'New-Object|\.Add\(|\.Visible|ShowDialog|\.Text\s*=') { continue }
+            [void]$sb.AppendLine('')
+            [void]$sb.AppendLine($t)
+        }
+        $p = Join-Path $env:TEMP ('AssetBridgeTrayWorker_{0}.ps1' -f $PID)
+        [System.IO.File]::WriteAllText($p, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+        $script:WorkerSlice = $p
+    } catch {
+        Log ('生成 worker 切片失败: ' + $_.Exception.Message)
+    }
+    return $script:WorkerSlice
+}
+
+function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
+                     [array]$workArgs = @(), [int]$timeoutSec = 90) {
+    # 启动后台任务。同 tag 不重入；没有 worker 切片（测试/冒烟环境）时退化为同步执行。
+    # 结果经同步哈希表回传，onDone 在 UI 线程（$bgTimer 轮询）被调用：
+    #   @{ ok=$true; r=结果 } 或 @{ ok=$false; err=... }
+    if ($script:BgJobs.ContainsKey($tag)) { return $false }
+    $slice = Get-WorkerSlice
+    if (-not $slice) {
+        $out = @{ ok = $false; err = 'no-worker-slice' }
+        try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { $out = @{ ok = $false; err = $_.Exception.Message } }
+        if ($onDone) { try { & $onDone $out } catch { Log ('后台回调异常 ({0}): {1}' -f $tag, $_.Exception.Message) } }
+        return $true
+    }
+    if (-not $script:BgPool) {
+        try {
+            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            # 注意：工厂静态方法在 RunspaceFactory 上，不在 RunspacePool 上（曾写错，运行时才炸）
+            $script:BgPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 2, $iss, $Host)
+            $script:BgPool.Open()
+        } catch {
+            Log ('创建 runspace 池失败，退化为同步: ' + $_.Exception.Message)
+            $out = @{ ok = $false; err = $_.Exception.Message }
+            try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { }
+            if ($onDone) { try { & $onDone $out } catch { } }
+            return $true
+        }
+    }
+    # 路径常量从托盘进程注入（runspace 里不能信切片里的 $MyInvocation 推导）
+    $consts = @{
+        ROOT = $ROOT; ScriptDir = $ScriptDir; PYTHON = $PYTHON; PYTHONW = $PYTHONW
+        RUNSERVER = $RUNSERVER; RUNTIME = $RUNTIME; LOG = $LOG; LOGDIR = $LOGDIR
+        SRVLOG = $SRVLOG; CONFIG = $CONFIG; LOCKFILE = $LOCKFILE
+        EDITOR_DAEMON = $EDITOR_DAEMON; EDITOR_CFG = $EDITOR_CFG; EDITOR_STATE = $EDITOR_STATE
+        ICONSRC = $ICONSRC; APPICON = $APPICON
+        ICON_OK = $ICON_OK; ICON_DOWN = $ICON_DOWN; ICON_WARN = $ICON_WARN; ICON_PAUSED = $ICON_PAUSED
+        SERVER = $SERVER
+    }
+    $sync = [hashtable]::Synchronized(@{})
+    $ps = [PowerShell]::Create()
+    try {
+        $null = $ps.RunspacePool = $script:BgPool
+        # 注意：AddArgument 返回 void，必须逐条调用（链式会在第二个调用上炸 null 方法）
+        $null = $ps.AddScript({
+            param($sliceFile, $sb, $args, $consts, $sync)
+            & $sliceFile
+            foreach ($k in @($consts.Keys)) {
+                Set-Variable -Name $k -Value $consts[$k] -Scope Script
+            }
+            try {
+                $sync.result = (& $sb @args)
+                $sync.ok = $true
+            } catch {
+                $sync.error = $_
+            }
+            $sync.done = $true
+        })
+        $null = $ps.AddArgument($slice)
+        $null = $ps.AddArgument($work)
+        $null = $ps.AddArgument($workArgs)
+        $null = $ps.AddArgument($consts)
+        $null = $ps.AddArgument($sync)
+        $handle = $ps.BeginInvoke()
+    } catch {
+        Log ('后台任务启动失败，退化为同步 ({0}): {1}' -f $tag, $_.Exception.Message)
+        try { $ps.Dispose() } catch { }
+        $out = @{ ok = $false; err = $_.Exception.Message }
+        try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { }
+        if ($onDone) { try { & $onDone $out } catch { } }
+        return $true
+    }
+    $script:BgJobs[$tag] = @{
+        ps = $ps; handle = $handle; sync = $sync; onDone = $onDone
+        started = [DateTime]::UtcNow; timeout = [int]$timeoutSec
+    }
+    return $true
+}
+
+function Stop-BgTasks {
+    foreach ($tag in @($script:BgJobs.Keys)) {
+        $j = $script:BgJobs[$tag]
+        try { $j.ps.Stop() } catch { }
+        try { $j.ps.Dispose() } catch { }
+    }
+    $script:BgJobs = @{}
+    if ($script:BgPool) {
+        try { $script:BgPool.Close() } catch { }
+        try { $script:BgPool.Dispose() } catch { }
+        $script:BgPool = $null
+    }
+}
 $script:PidCache   = @{ pid = 0; ts = 0 }   # Get-ServerPid 的缓存（见该函数内的性能说明）
 # 手动指定的软件路径 { key -> exe / 引擎根目录 }，持久化在 tray_config.json 的 manual_paths。
 # 自动检测漏掉的软件（如装在非标准位置的 Maya）指定一次后就记住，刷新/重开安装器仍然认。
@@ -533,21 +703,39 @@ function Apply-Icon([string]$state) {
 $script:StatusLabel = $null
 $script:LogBox      = $null
 
-function Refresh-State {
+function Get-StateData {
+    # 后台线程调用：只做探测与守护自愈，不碰任何 UI 对象。
+    # 依赖的 $script:Guard / $script:Port 由调用方通过 workArgs 注入（runspace 不共享变量）。
     $up = Test-Server
-    $script:LastUp = $up
+    if (-not $up -and $script:Guard) {
+        Log '检测到服务未运行 -> 自动拉起'
+        Start-Server
+        Start-Sleep -Milliseconds 400
+        $up = Test-Server
+    }
+    $pid = 0
+    if ($up) { try { $pid = Get-ServerPid } catch { } }
+    $edUp = $false
+    try { $edUp = ((Get-EditorDaemonPid) -gt 0) } catch { }
+    return @{ up = [bool]$up; pid = [int]$pid; edUp = [bool]$edUp }
+}
+
+function Refresh-State($data) {
+    # UI 线程：只把 $data 画到界面。$data 为空时同步采集（测试/兜底路径）。
+    if (-not $data) { $data = Get-StateData }
+    $script:LastUp = [bool]$data.up
 
     # 图标四态：运行/掉线待自愈/运行但守护暂停/已停止
     $state = 'down'
-    if ($up) {
+    if ($script:LastUp) {
         if ($script:Guard) { $state = 'ok' } else { $state = 'paused' }
     } else {
         if ($script:Guard) { $state = 'warn' } else { $state = 'down' }
     }
     Apply-Icon $state
 
-    if ($up) {
-        $p = Get-ServerPid
+    if ($script:LastUp) {
+        $p = [int]$data.pid
         if ($script:Guard) {
             $ni.Text = ('AssetBridge 运行中 :{0} pid={1}' -f $script:Port, $p)
         } else {
@@ -562,8 +750,8 @@ function Refresh-State {
     }
     if ($script:StatusLabel -ne $null) { Update-StatusWindow }
 
-    # 编辑器守护（PS/SAI2）状态：菜单文字 + 按钮可用性
-    $script:LastEdUp = (Test-EditorDaemon)
+    # 编辑器守护（PS/SAI2/ZBrush）状态：菜单文字 + 按钮可用性
+    $script:LastEdUp = [bool]$data.edUp
     if ($miEdState -ne $null) { $miEdState.Text = (Get-EditorDaemonStatusText) }
     if ($miEdStart -ne $null) { $miEdStart.Enabled = (-not $script:LastEdUp) }
     if ($miEdStop  -ne $null) { $miEdStop.Enabled  = $script:LastEdUp }
@@ -657,16 +845,53 @@ $miInstall = $menu.Items.Add('安装插件...')
 $miExitAll = $menu.Items.Add('退出并停止服务')
 $miExit    = $menu.Items.Add('退出（服务保持运行）')
 
-$miStart.add_Click({   Start-Server;  Start-Sleep -Milliseconds 400; Refresh-State })
-$miStop.add_Click({    Stop-Server;   Start-Sleep -Milliseconds 400; Refresh-State })
-$miRestart.add_Click({ Stop-Server;   Start-Sleep -Seconds 1; Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+# 服务控制点击：只启动后台任务，UI 线程立即返回（绝不在 UI 线程 Sleep/等网络）
+$miStart.add_Click({
+    $null = Start-BgTask 'srv' {
+        param($port)
+        $script:Port = [int]$port
+        Start-Server
+        Start-Sleep -Milliseconds 300
+        Get-StateData
+    } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
+})
+$miStop.add_Click({
+    $null = Start-BgTask 'srv' {
+        param($port)
+        $script:Port = [int]$port
+        Stop-Server
+        Get-StateData
+    } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
+})
+$miRestart.add_Click({
+    $null = Start-BgTask 'srv' {
+        param($port)
+        $script:Port = [int]$port
+        Stop-Server
+        Start-Sleep -Seconds 1
+        Start-Server
+        Start-Sleep -Milliseconds 400
+        Get-StateData
+    } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 60
+})
 $miGuard.add_Click({
     $script:Guard = -not $script:Guard
     if ($script:Guard) { $miGuard.Text = '暂停守护'; Log '守护已恢复' } else { $miGuard.Text = '恢复守护'; Log '守护已暂停' }
     Refresh-State
 })
-$miEdStart.add_Click({ Start-EditorDaemon; Start-Sleep -Milliseconds 600; Refresh-State })
-$miEdStop.add_Click({  Stop-EditorDaemon;  Start-Sleep -Milliseconds 400; Refresh-State })
+$miEdStart.add_Click({
+    $null = Start-BgTask 'ed' {
+        Start-EditorDaemon
+        Start-Sleep -Milliseconds 500
+        Get-StateData
+    } { param($d) if ($d.ok) { Refresh-State $d.r } } 30
+})
+$miEdStop.add_Click({
+    $null = Start-BgTask 'ed' {
+        Stop-EditorDaemon
+        Get-StateData
+    } { param($d) if ($d.ok) { Refresh-State $d.r } } 30
+})
 $miLog.add_Click({    Start-Process -FilePath 'notepad.exe' -ArgumentList $LOG })
 $miSrvLog.add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList $SRVLOG })
 $miFolder.add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList $ROOT })
@@ -724,13 +949,38 @@ function Show-StatusWindow {
 
         # 按钮：左侧 16px 小图标 + 右侧文字（图标来自 assets\icons\png\16）
         $b1 = New-AbButton $f '启动'       'act_start.png'    14  96
-        $b1.add_Click({ Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+        $b1.add_Click({
+            $null = Start-BgTask 'srv' {
+                param($port)
+                $script:Port = [int]$port
+                Start-Server
+                Start-Sleep -Milliseconds 300
+                Get-StateData
+            } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
+        })
 
         $b2 = New-AbButton $f '停止'       'act_stop.png'     118 96
-        $b2.add_Click({ Stop-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+        $b2.add_Click({
+            $null = Start-BgTask 'srv' {
+                param($port)
+                $script:Port = [int]$port
+                Stop-Server
+                Get-StateData
+            } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
+        })
 
         $b3 = New-AbButton $f '重启'       'act_restart.png'  222 96
-        $b3.add_Click({ Stop-Server; Start-Sleep -Seconds 1; Start-Server; Start-Sleep -Milliseconds 400; Refresh-State })
+        $b3.add_Click({
+            $null = Start-BgTask 'srv' {
+                param($port)
+                $script:Port = [int]$port
+                Stop-Server
+                Start-Sleep -Seconds 1
+                Start-Server
+                Start-Sleep -Milliseconds 400
+                Get-StateData
+            } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 60
+        })
 
         $b4 = New-AbButton $f '设置...'    'act_settings.png' 326 96
         $b4.add_Click({ Show-Settings })
@@ -1628,10 +1878,12 @@ function Copy-Plugin([string]$src, [string]$dst, [string]$label, $app) {
         return "已安装 $label -> $dst"
     } catch { return "安装失败 $label : $_" }
 }
-function Update-EditorDaemonConfig {
-    # 把检测到 / 手动指定的 PS、SAI2 路径同步进 tools\editor_daemon.json
+function Update-EditorDaemonConfig($apps) {
+    # 把检测到 / 手动指定的 PS、SAI2、ZBrush 路径同步进 tools\editor_daemon.json
     #（守护进程从这里读 exe；找不到的键保留原值，绝不删）。
     # 手动指定优先于自动检测——用户显式选过的路径就是最终意愿。
+    # $apps 可由后台任务传入（runspace 里读不到 $script:IApps）。
+    if (-not $apps) { $apps = $script:IApps }
     $cfgPath = Join-Path $ROOT 'tools\editor_daemon.json'
     $data = $null
     if (Test-Path $cfgPath) {
@@ -1647,7 +1899,7 @@ function Update-EditorDaemonConfig {
         if ($script:ManualPaths.ContainsKey($k)) { $exe = [string]$script:ManualPaths[$k] }
         if (-not $exe) {
             $a = $null
-            if ($script:IApps) { $a = $script:IApps | Where-Object { $_.key -eq $k } | Select-Object -First 1 }
+            if ($apps) { $a = $apps | Where-Object { $_.key -eq $k } | Select-Object -First 1 }
             if ($a -and $a.ok -and $a.path) { $exe = [string]$a.path }
         }
         if ($exe -and (Test-Path -LiteralPath $exe) -and $apps[$k] -ne $exe) {
@@ -2109,9 +2361,31 @@ $script:IInstallBtns  = @{}
 $script:IUninstallBtns = @{}
 $script:IStatusLabel  = @{}
 $script:IApps         = @()
+$script:InstallerForm = $null
 
 function Update-InstallerUI {
-    $script:IApps = @(Find-AllApps)
+    # 异步驱动：Find-AllApps（注册表 + 全盘扫描，秒级）放后台 runspace 跑，
+    # UI 线程只置「检测中」——开窗/点刷新不再卡住界面。
+    if ($script:IStatus -ne $null) { $script:IStatus.Text = '正在检测本机软件...' }
+    $null = Start-BgTask 'detect' {
+        param($mp)
+        $script:ManualPaths = $mp
+        $apps = @(Find-AllApps)
+        Update-EditorDaemonConfig $apps
+        $apps
+    } {
+        param($d)
+        if (-not $d.ok) {
+            if ($script:IStatus -ne $null) { $script:IStatus.Text = ('检测失败: ' + $d.err) }
+            return
+        }
+        Apply-InstallerUI -apps @($d.r)
+    } @($script:ManualPaths) 180
+}
+
+function Apply-InstallerUI($apps) {
+    # UI 线程：只把结果画到报告/按钮/短标签（零扫描零 IO）
+    $script:IApps = @($apps)
     $byKey = @{}
     foreach ($a in $script:IApps) { $byKey[$a.key] = $a }
     $lines = @()
@@ -2158,34 +2432,45 @@ function Update-InstallerUI {
     if ($script:InstallSource) { $lines += ("安装源: " + $script:InstallSource) }
     else { $lines += ('安装源: ' + $ROOT + '\plugins（本仓库）') }
     if ($script:IReport) { $script:IReport.Text = [string]::Join([Environment]::NewLine, $lines) }
-    # 检测/指定完 PS、SAI2 后，把路径同步进编辑器守护配置（有变化才写盘）
-    Update-EditorDaemonConfig
+    if ($script:IStatus -ne $null) {
+        $script:IStatus.Text = ('检测完成  ' + (Get-Date -Format 'HH:mm:ss'))
+    }
 }
 
 function Show-Installer {
+    # 单例：已开着就激活（不重复开窗）
+    if ($script:InstallerForm -ne $null) {
+        try {
+            if (-not $script:InstallerForm.IsDisposed) {
+                $script:InstallerForm.Activate()
+                return
+            }
+        } catch { }
+    }
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Asset Bridge 插件安装器'
-    $form.ClientSize = New-Object System.Drawing.Size(560, 644)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 648)   # 8 软件重排后的高度
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
+    $form.add_FormClosed({ $script:InstallerForm = $null })
 
     $report = New-Object System.Windows.Forms.TextBox
-    $report.SetBounds(14, 14, 532, 240)
+    $report.SetBounds(14, 14, 532, 220)
     $report.Multiline = $true; $report.ReadOnly = $true; $report.ScrollBars = 'Vertical'
     $report.Font = New-Object System.Drawing.Font('Consolas', 9)
     $form.Controls.Add($report)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.SetBounds(14, 262, 532, 20)
+    $status.SetBounds(14, 240, 532, 20)
     $form.Controls.Add($status)
 
     $bRefresh = New-Object System.Windows.Forms.Button
-    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 288, 100, 30)
+    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 264, 100, 30)
     $form.Controls.Add($bRefresh)
 
     $bDl = New-Object System.Windows.Forms.Button
-    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 288, 160, 30)
+    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 264, 160, 30)
     $form.Controls.Add($bDl)
 
     $bInstall = @{}
@@ -2194,14 +2479,14 @@ function Show-Installer {
     $bStatus = @{}
 
     # 每软件一行：[软件名 88] [主按钮 190x28] [指定📁 34x28] [卸载🗑 34x28] [状态 120]
-    # 21 个按钮从「三组纵排」压成 7 行，消除窗口溢出。主按钮文字与事件回调逻辑不变。
-    $rowY0 = 352; $rowH = 34
+    # 8 个软件 8 行：318 起、行高 32 -> 末行底 574，关闭按钮 588，不再互相遮挡。
+    $rowY0 = 318; $rowH = 32
     $tip = New-Object System.Windows.Forms.ToolTip
     $tip.AutoPopDelay = 8000; $tip.InitialDelay = 400; $tip.ReshowDelay = 100
     $iconSrc20 = Join-Path $ScriptDir 'icons'   # 20px 行内图标（act_folder/act_trash）
 
     $lbl1 = New-Object System.Windows.Forms.Label
-    $lbl1.Text = '按软件操作（每行一个软件）：'; $lbl1.SetBounds(14, 328, 532, 18)
+    $lbl1.Text = '按软件操作（每行一个软件）：'; $lbl1.SetBounds(14, 298, 532, 18)
     $form.Controls.Add($lbl1)
     $idx = 0
     foreach ($meta in $AB_APPS_META) {
@@ -2250,7 +2535,7 @@ function Show-Installer {
     }
 
     $bClose = New-Object System.Windows.Forms.Button
-    $bClose.Text = '关闭'; $bClose.SetBounds(232, 600, 96, 30)
+    $bClose.Text = '关闭'; $bClose.SetBounds(232, 588, 96, 28)
     $bClose.add_Click({ $form.Close() })
     $form.Controls.Add($bClose)
 
@@ -2262,16 +2547,21 @@ function Show-Installer {
     $script:IStatusLabel   = $bStatus
 
     $bRefresh.add_Click({
-        $script:IStatus.Text = '正在检测...'
-        $script:IStatus.Update()
+        # 刷新检测（内部已异步：后台跑 Find-AllApps，UI 不卡）
         Update-InstallerUI
-        $script:IStatus.Text = '已重新检测  ' + (Get-Date -Format 'HH:mm:ss')
     })
     $bDl.add_Click({
-        $script:IStatus.Text = '正在从 GitHub 下载...'
-        $script:IStatus.Update()
-        $script:IStatus.Text = (Get-PluginSourceFromGitHub)
-        Update-InstallerUI
+        # GitHub 下载是分钟级操作：后台跑，按钮置忙，完成后自动重检测
+        $bDl.Enabled = $false; $bDl.Text = '下载中...'
+        $null = Start-BgTask 'github' {
+            Get-PluginSourceFromGitHub
+        } {
+            param($d)
+            $bDl.Enabled = $true; $bDl.Text = '从 GitHub 下载最新版'
+            $msg = $(if ($d.ok) { [string]$d.r } else { ('下载失败: ' + $d.err) })
+            if ($script:IStatus -ne $null) { $script:IStatus.Text = $msg }
+            Update-InstallerUI
+        } 600
     })
     foreach ($meta in $AB_APPS_META) {
         $bInstall[$meta.k].add_Click({
@@ -2279,8 +2569,17 @@ function Show-Installer {
             try {
                 $a = $script:IApps | Where-Object { $_.key -eq $sender.Tag } | Select-Object -First 1
                 if (-not $a) { $script:IStatus.Text = '未检测到该软件，请用「指定」按钮手动选择路径'; return }
-                $script:IStatus.Text = (Install-App $a)
-                Update-InstallerUI
+                # 拷贝插件是磁盘 IO：后台跑，UI 只显示进度
+                if ($script:IStatus -ne $null) { $script:IStatus.Text = ('正在安装 ' + $a.name + '...') }
+                $null = Start-BgTask 'install' {
+                    param($app)
+                    Install-App $app
+                } {
+                    param($d)
+                    $msg = $(if ($d.ok) { [string]$d.r } else { ('操作失败: ' + $d.err) })
+                    if ($script:IStatus -ne $null) { $script:IStatus.Text = $msg }
+                    Update-InstallerUI
+                } @($a) 300
             } catch {
                 $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
                 Log ('安装器: 安装事件出错 -> ' + $_.Exception.Message)
@@ -2295,8 +2594,16 @@ function Show-Installer {
                     ("确定卸载 " + $a.name + " 的 Asset Bridge 插件吗？`n`n将从以下位置移除（会先备份到 backups/，可回滚）：`n" + (@($a.targets) -join "`n")),
                     '确认卸载', 'YesNo', 'Warning')
                 if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-                $script:IStatus.Text = (Uninstall-App $a)
-                Update-InstallerUI
+                if ($script:IStatus -ne $null) { $script:IStatus.Text = ('正在卸载 ' + $a.name + '...') }
+                $null = Start-BgTask 'uninstall' {
+                    param($app)
+                    Uninstall-App $app
+                } {
+                    param($d)
+                    $msg = $(if ($d.ok) { [string]$d.r } else { ('操作失败: ' + $d.err) })
+                    if ($script:IStatus -ne $null) { $script:IStatus.Text = $msg }
+                    Update-InstallerUI
+                } @($a) 300
             } catch {
                 $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
                 Log ('安装器: 卸载事件出错 -> ' + $_.Exception.Message)
@@ -2305,10 +2612,19 @@ function Show-Installer {
         $bManual[$meta.k].add_Click({
             param($sender, $e)
             try {
+                # 路径对话框必须在 UI 线程；随后的安装/同步走后台
                 $app = Request-ManualPath $sender.Tag
                 if ($app) {
-                    $script:IStatus.Text = (Install-App $app)
-                    Update-InstallerUI
+                    if ($script:IStatus -ne $null) { $script:IStatus.Text = ('正在安装 ' + $app.name + '...') }
+                    $null = Start-BgTask 'install' {
+                        param($a2)
+                        Install-App $a2
+                    } {
+                        param($d)
+                        $msg = $(if ($d.ok) { [string]$d.r } else { ('操作失败: ' + $d.err) })
+                        if ($script:IStatus -ne $null) { $script:IStatus.Text = $msg }
+                        Update-InstallerUI
+                    } @($app) 300
                 }
             } catch {
                 $script:IStatus.Text = ('操作失败：{0}（详见日志）' -f $_.Exception.Message)
@@ -2318,21 +2634,26 @@ function Show-Installer {
     }
 
     Set-FormIcon $form
+    # 非模态显示 + 异步检测：窗口立即可交互，检测期间不卡界面
     Update-InstallerUI
-    [void]$form.ShowDialog()
+    [void]$form.Show()
+    $form.Activate()
 }
 
 # ---- 自检定时器 -----------------------------------------------------------
+# tick 里只启动后台任务（探测/自愈/状态采集），UI 线程零阻塞。
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $script:Interval * 1000
 $timer.add_Tick({
-    $up = Test-Server
-    $script:LastUp = $up
-    if (-not $up -and $script:Guard) {
-        Log '检测到服务未运行 -> 自动拉起'
-        Start-Server
-    }
-    Refresh-State
+    $null = Start-BgTask 'state' {
+        param($guard, $port)
+        $script:Guard = [bool]$guard
+        $script:Port  = [int]$port
+        Get-StateData
+    } {
+        param($d)
+        if ($d.ok) { Refresh-State $d.r } else { Log ('状态采集失败: ' + $d.err) }
+    } @($script:Guard, $script:Port) 30
     # D3：ZBrush 落盘通知（守护进程写 notify.json -> 气泡展示路径，点击复制，10s 自动消失）
     try {
         $nf = Join-Path $EDITOR_STATE 'notify.json'
@@ -2349,19 +2670,62 @@ $timer.add_Tick({
     } catch { }
 })
 
+# 日志刷写定时器：队列 -> 文件（500ms 一批，UI 线程不同步写盘）
+$logTimer = New-Object System.Windows.Forms.Timer
+$logTimer.Interval = 500
+$logTimer.add_Tick({ Flush-Log })
+
+# 后台任务回收定时器：150ms 轮询同步哈希表，完成后在 UI 线程执行回调（含超时强停）
+$bgTimer = New-Object System.Windows.Forms.Timer
+$bgTimer.Interval = 150
+$bgTimer.add_Tick({
+    foreach ($tag in @($script:BgJobs.Keys)) {
+        $j = $script:BgJobs[$tag]
+        $out = $null
+        $finished = $false
+        if ($j.sync.done) {
+            if ($j.sync.ok) { $out = @{ ok = $true; r = $j.sync.result } }
+            else { $out = @{ ok = $false; err = $j.sync.error } }
+            $finished = $true
+        } elseif ((([DateTime]::UtcNow - $j.started).TotalSeconds) -gt $j.timeout) {
+            try { $j.ps.Stop() } catch { }
+            $out = @{ ok = $false; err = 'TIMEOUT' }
+            $finished = $true
+            Log ('后台任务超时({0}s): {1}' -f $j.timeout, $tag)
+        }
+        if ($finished) {
+            # EndInvoke 只做尽力回收（PS 5.1 对跨线程 EndInvoke 有坑，结果以 sync 为准）
+            try { $null = $j.ps.EndInvoke($j.handle) } catch { }
+            try { $j.ps.Dispose() } catch { }
+            $script:BgJobs.Remove($tag)
+            if ($j.onDone) {
+                try { & $j.onDone $out } catch { Log ('后台回调异常 ({0}): {1}' -f $tag, $_.Exception.Message) }
+            }
+        }
+    }
+})
+
 # 双击托盘图标 -> 状态窗
 $ni.add_DoubleClick({ Show-StatusWindow })
 
 # ---- 启动 ----------------------------------------------------------------
 Load-Config
 $timer.Interval = $script:Interval * 1000
+$logTimer.Start()
+$bgTimer.Start()
+$script:LogTimerReady = $true
 Log ('托盘启动 port={0} interval={1}' -f $script:Port, $script:Interval)
 
-Refresh-State
-if (-not $script:LastUp -and $script:Guard) {
-    Log '启动时服务未运行 -> 拉起'
-    Start-Server
-}
+# 启动时状态采集也走后台（含服务未运行时的自动拉起），UI 立即可见
+$null = Start-BgTask 'state' {
+    param($guard, $port)
+    $script:Guard = [bool]$guard
+    $script:Port  = [int]$port
+    Get-StateData
+} {
+    param($d)
+    if ($d.ok) { Refresh-State $d.r } else { Log ('启动状态采集失败: ' + $d.err) }
+} @($script:Guard, $script:Port) 30
 $ni.Visible = $true
 $timer.Start()
 

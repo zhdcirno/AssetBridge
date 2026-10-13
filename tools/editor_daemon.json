@@ -2,6 +2,7 @@
   "server_url": "http://127.0.0.1:27631",
   "apps": {
     "photoshop": "D:\\DCC\\Adobe Photoshop 2023\\Photoshop.exe",
-    "sai2": "D:\\DCC\\[Saier]SAI Ver.2\\sai2.exe"
+    "sai2": "D:\\DCC\\[Saier]SAI Ver.2\\sai2.exe",
+    "zbrush": "D:\\DCC\\Zbrush2026.2.1\\ZBrush.exe"
   }
 }

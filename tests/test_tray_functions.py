@@ -202,10 +202,14 @@ with io.open(smoke_wrapper, "w", encoding="utf-8-sig") as fh:
     fh.write(smoke_body)
 
 log_before = _log_size()
+# ASSETBRIDGE_SMOKE=1：旁路单实例检查——真实托盘在跑时也能验证启动路径
+smoke_env = dict(os.environ)
+smoke_env["ASSETBRIDGE_SMOKE"] = "1"
 smoke_proc = subprocess.run(
     [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
      "-File", smoke_wrapper],
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150)
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150,
+    env=smoke_env)
 delta = _log_delta(log_before)
 try:
     os.remove(smoke_wrapper)

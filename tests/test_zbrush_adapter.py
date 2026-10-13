@@ -256,11 +256,158 @@ class TestDaemonZBrush(unittest.TestCase):
         self.assertEqual(args[:-2], ["a.obj", "b.obj"])
 
 
+class TestImportPending(unittest.TestCase):
+    """主线程导入：有界、对话框探针、回执与消费。用假 zbc 注入，不依赖 ZBrush。"""
+
+    class FakeZbc(object):
+        def __init__(self, tool_after="cube", dialog=False, raise_on_press=False):
+            self.calls = []
+            self.tool_after = tool_after
+            self.dialog = dialog
+            self.raise_on_press = raise_on_press
+
+        def has_next_filename(self):
+            return self.dialog
+
+        def set_next_filename(self, p):
+            self.calls.append(("set_next_filename", p))
+
+        def press(self, item):
+            self.calls.append(("press", item))
+            if self.raise_on_press:
+                raise RuntimeError("native dialog blocked")
+
+        def get_active_tool_path(self):
+            return self.tool_after
+
+        def update(self, n=1, redraw=False):
+            self.calls.append(("update", n, redraw))
+
+        def set_notebar_text(self, t, p=0.0):
+            self.calls.append(("notebar", t))
+
+    def setUp(self):
+        self._orig_zbc = PLUGIN._zbc
+        self.td = tempfile.mkdtemp()
+        self.inbox = os.path.join(self.td, "zbrush_inbox")
+        os.makedirs(self.inbox)
+        self.cfg = dict(PLUGIN.DEFAULT_CONFIG)
+        self.cfg.update({"payload_dir": self.td, "inbox_dir": self.inbox,
+                         "outbox_dir": os.path.join(self.td, "zbrush_outbox"),
+                         "import_wait_sec": 3.0})
+
+    def tearDown(self):
+        PLUGIN._zbc = self._orig_zbc
+
+    def _task(self, tid="t1", files=("a.obj",)):
+        for f in files:
+            make_obj(os.path.join(self.td, f))
+        task = {"transfer_id": tid, "from_app": "blender",
+                "files": [os.path.join(self.td, f) for f in files]}
+        Path(os.path.join(self.inbox, tid + ".json")).write_text(
+            json.dumps(task), encoding="utf-8")
+
+    def test_import_happy_path(self):
+        self._task()
+        fake = self.FakeZbc(tool_after="a")
+        PLUGIN._zbc = lambda: fake
+        n = PLUGIN.import_pending(self.cfg)
+        self.assertEqual(n, 1)
+        self.assertIn(("press", "Tool:Import"), fake.calls)
+        rp = os.path.join(self.inbox, "t1.done.json")
+        self.assertTrue(os.path.isfile(rp))
+        receipt = json.loads(Path(rp).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "ok")
+        self.assertEqual(receipt["imported"], ["a.obj"])
+        # 任务文件消费后即删
+        self.assertFalse(os.path.isfile(os.path.join(self.inbox, "t1.json")))
+
+    def test_dialog_suspected_skips_import(self):
+        self._task()
+        fake = self.FakeZbc(dialog=True)
+        PLUGIN._zbc = lambda: fake
+        PLUGIN.import_pending(self.cfg)
+        # 有对话框风险 -> 不 press（绝不挂起主线程），回执记 error
+        self.assertNotIn(("press", "Tool:Import"), fake.calls)
+        receipt = json.loads(Path(os.path.join(self.inbox, "t1.done.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "error")
+        self.assertIn("对话框", receipt["error"])
+
+    def test_press_exception_is_caught(self):
+        self._task()
+        fake = self.FakeZbc(raise_on_press=True)
+        PLUGIN._zbc = lambda: fake
+        PLUGIN.import_pending(self.cfg)   # 不能抛
+        receipt = json.loads(Path(os.path.join(self.inbox, "t1.done.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "error")
+
+    def test_import_wait_is_bounded(self):
+        """工具名永远不匹配也不能挂死：import_wait_sec 内必须返回。"""
+        self._task()
+        fake = self.FakeZbc(tool_after="something_else")
+        PLUGIN._zbc = lambda: fake
+        t0 = time.time()
+        PLUGIN.import_pending(self.cfg)
+        self.assertLess(time.time() - t0, 10.0)
+
+    def test_watcher_is_pure_io_and_detects_pending(self):
+        """观察线程：不起 zbc、能发现待收任务并写状态文件。"""
+        self._task(tid="t2")
+        PLUGIN._zbc = lambda: (_ for _ in ()).throw(
+            AssertionError("观察线程绝不调用 zbc"))
+        started = PLUGIN.start_watcher(self.cfg)
+        self.assertTrue(started)
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            if os.path.isfile(PLUGIN.heartbeat_path(self.cfg)):
+                break
+            time.sleep(0.2)
+        self.assertTrue(os.path.isfile(PLUGIN.heartbeat_path(self.cfg)))
+        time.sleep(2.5)   # 等观察线程扫到任务
+        st = json.loads(Path(PLUGIN.status_path(self.cfg)).read_text(encoding="utf-8"))
+        self.assertGreaterEqual(st["pending"], 1)
+        # 幂等：重复启动只起一个
+        self.assertFalse(PLUGIN.start_watcher(self.cfg))
+
+    def test_auto_loop_exits_after_one_iteration(self):
+        """自动导入（实验）：update 回调里置停止位 -> 循环必须退出，不能卡死。"""
+        fake = self.FakeZbc(tool_after="a")
+
+        def _update(n=1, redraw=False):
+            fake.calls.append(("update", n, redraw))
+            PLUGIN._STATE["auto"] = False      # 第一圈结束即停
+
+        fake.update = _update
+        PLUGIN._zbc = lambda: fake
+        PLUGIN._STATE["auto"] = False
+        t0 = time.time()
+        PLUGIN.auto_loop(self.cfg)             # 必须自行返回
+        self.assertLess(time.time() - t0, 10.0)
+        self.assertFalse(PLUGIN._STATE["auto"])
+
+    def test_toggle_auto_stop_path(self):
+        PLUGIN._zbc = lambda: self.FakeZbc()
+        PLUGIN._STATE["auto"] = True
+        msg = PLUGIN.toggle_auto(self.cfg)
+        self.assertEqual(msg, "自动导入：正在停止…")
+        self.assertFalse(PLUGIN._STATE["auto"])
+
+
 class TestModuleHygiene(unittest.TestCase):
     def test_plugin_has_no_zbrush_import_at_top(self):
+        """顶层没有 import zbrush（懒加载在 _zbc() 里）——用 AST 查，别被 docstring 骗。"""
+        import ast
         src = (ROOT / "plugins" / "zbrush" / "asset_bridge_zbrush" /
                "asset_bridge_zbrush.py").read_text(encoding="utf-8")
-        self.assertNotIn("import zbrush.commands", src.split("def _zbc")[0])
+        tree = ast.parse(src)
+        top_imports = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                top_imports += [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                top_imports.append(node.module or "")
+        self.assertNotIn("zbrush.commands", top_imports)
+        self.assertNotIn("zbrush", top_imports)
 
     def test_daemon_app_labels(self):
         self.assertIn("zbrush", DAEMON.APP_LABELS)
