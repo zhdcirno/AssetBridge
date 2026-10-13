@@ -24,6 +24,40 @@ import shutil
 import subprocess
 import sys
 
+# bug 1 修复：Windows 控制台默认 GBK，print 到 GBK stdout 遇 U+FFFD/生僻字会
+# UnicodeEncodeError。统一把本进程 stdout/stderr 重配为 UTF-8 + replace。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def ps_decode(raw):
+    """bug 2 修复的读取侧兜底：子进程输出解码。
+
+    根因：PowerShell 子进程重定向 stdout 的编码跟随控制台代码页
+    （中文 Windows = GBK/cp936），此前按 UTF-8 解码 → 中文全部变
+    「锟斤拷」乱码。已在子进程脚本头部强制 UTF-8（见 PS_UTF8_PROLOGUE），
+    这里再做双保险：UTF-8 解码出现大量 U+FFFD 时退回 GBK 重试，取更优者。
+    """
+    txt = raw.decode("utf-8", "replace")
+    bad = txt.count("\ufffd")
+    if bad > 8:
+        try:
+            alt = raw.decode("gbk", "replace")
+            if alt.count("\ufffd") < bad:
+                return alt
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return txt
+
+
+# 注入子进程脚本头部的编码前导：强制 PowerShell 以 UTF-8 写重定向 stdout。
+PS_UTF8_PROLOGUE = (
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\r\n"
+    "$OutputEncoding = [System.Text.Encoding]::UTF8\r\n"
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PS1 = os.path.join(ROOT, "tray", "assetbridge_tray.ps1")
@@ -136,7 +170,7 @@ with io.open(test_path, "w", encoding="utf-8-sig") as fh:
 
 runner = os.path.join(HERE, "_tray_slice_run.ps1")
 with io.open(runner, "w", encoding="utf-8-sig") as fh:
-    fh.write(". '{0}'\n. '{1}'\n".format(slice_path, test_path))
+    fh.write(PS_UTF8_PROLOGUE + ". '{0}'\n. '{1}'\n".format(slice_path, test_path))
 
 # 备份 editor_daemon.json，避免测试写入污染真实配置
 backup = None
@@ -149,7 +183,7 @@ proc = subprocess.run(
     [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
      "-File", runner],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
-out = proc.stdout.decode("utf-8", "replace")
+out = ps_decode(proc.stdout)
 
 # 还原 editor_daemon.json
 if backup and os.path.exists(backup):
@@ -197,7 +231,7 @@ pump = ("\n# ==== 运行时冒烟：有界消息泵（替代 Application.Run）=
         "    [System.Windows.Forms.Application]::DoEvents()\n"
         "    Start-Sleep -Milliseconds 100\n"
         "}\n")
-smoke_body = smoke_src[:ri] + pump + smoke_src[ri + len(run_mark):]
+smoke_body = PS_UTF8_PROLOGUE + smoke_src[:ri] + pump + smoke_src[ri + len(run_mark):]
 with io.open(smoke_wrapper, "w", encoding="utf-8-sig") as fh:
     fh.write(smoke_body)
 
@@ -220,7 +254,7 @@ problems = []
 if smoke_proc.returncode != 0:
     problems.append("冒烟子进程退出码 {0}: {1}".format(
         smoke_proc.returncode,
-        smoke_proc.stdout.decode("utf-8", "replace")[-800:]))
+        ps_decode(smoke_proc.stdout)[-800:]))
 if "未处理异常" in delta:
     problems.append("启动路径出现未处理异常:\n" + delta[-800:])
 if "托盘启动 port=" not in delta:

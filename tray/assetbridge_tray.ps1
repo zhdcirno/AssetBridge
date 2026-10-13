@@ -674,11 +674,11 @@ function Get-StateData {
         Start-Sleep -Milliseconds 400
         $up = Test-Server
     }
-    $pid = 0
-    if ($up) { try { $pid = Get-ServerPid } catch { } }
+    $srvPid = 0
+    if ($up) { try { $srvPid = Get-ServerPid } catch { } }
     $edUp = $false
     try { $edUp = ((Get-EditorDaemonPid) -gt 0) } catch { }
-    return @{ up = [bool]$up; pid = [int]$pid; edUp = [bool]$edUp }
+    return @{ up = [bool]$up; pid = [int]$srvPid; edUp = [bool]$edUp }
 }
 
 function Refresh-State($data) {
