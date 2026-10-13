@@ -242,15 +242,30 @@ function Get-WorkerSliceText {
         $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$tokens, [ref]$errs)
         $sb = New-Object System.Text.StringBuilder
         $cut = $src.IndexOf('$script:ReallyExit = $false')
-        if ($cut -gt 0) { [void]$sb.Append($src.Substring(0, $cut)) }
+        # 2026-10-13 修复：路径常量块在切片里有【两份来源】——head 段（原始文本）和
+        # tail 段（EndBlock 顶层赋值追加）。它们是同一段源码的两个视图，必须两段都剔，
+        # 否则 tail 会把常量赋值从尾巴塞回切片（2026-10-13 深夜实机教训：切片 2553 行）。
+        # job 无文件环境里 $MyInvocation.MyCommand.Definition 是「job 脚本块全文」而非
+        # 路径，Split-Path/Join-Path 推导必然产出垃圾或直接报错；全部常量由 $consts 在
+        # IEX 之前注入当前 scope。正则区分大小写，避免误杀函数内小写局部变量。
+        $constRe = '(?-i)^\s*\$(ScriptDir|ROOT|PYTHON|PYTHONW|SERVER|RUNSERVER|RUNTIME|EDITOR_DAEMON|EDITOR_CFG|EDITOR_STATE|LOGDIR|LOG|SRVLOG|CONFIG|LOCKFILE|ICONSRC|APPICON|ICON_OK|ICON_DOWN|ICON_WARN|ICON_PAUSED)\s*='
+        if ($cut -gt 0) {
+            $headLines = @(($src.Substring(0, $cut) -split "`r?`n") | Where-Object { $_ -notmatch $constRe })
+            [void]$sb.Append(($headLines -join "`n"))
+        }
         foreach ($n in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine($n.Extent.Text)
         }
         foreach ($st in $ast.EndBlock.Statements) {
             if ($st -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
+            # 只保留【纯变量赋值】（$x = / $script:x = ）。属性赋值（$mi.Enabled = ...）、
+            # 索引赋值的目标全是 UI 对象，job 里不存在（$null），EAP=Stop 下 IEX 必炸
+            # （2026-10-13 深夜 sim3 实证：$miState.Enabled 在切片 2588 行）。
+            if ($st.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
             $t = $st.Extent.Text
             if ($t -match 'New-Object|\.Add\(|\.Visible|ShowDialog|\.Text\s*=') { continue }
+            if ($t -match $constRe) { continue }   # tail 段同样剔除常量块（head 已剔，这里别塞回去）
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine($t)
         }
@@ -266,9 +281,10 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
     # 启动后台作业。同 tag 不重入；拿不到切片时退化为同步执行（测试/冒烟环境）。
     # onDone 在 UI 线程（$bgTimer 轮询）被调用，参数 @{ ok=$true; r=结果 }
     # 或 @{ ok=$false; err=... }。
-    if ($script:BgJobs.ContainsKey($tag)) { return $false }
+    if ($script:BgJobs.ContainsKey($tag)) { Log ('btn={0} busy, ignored (previous task still running)' -f $tag); return $false }
     $slice = Get-WorkerSliceText
     if (-not $slice) {
+        Log ('bg-task sync-fallback (no slice): tag={0}' -f $tag)
         $out = @{ ok = $false; err = 'no-worker-slice' }
         try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { $out = @{ ok = $false; err = $_.Exception.Message } }
         if ($onDone) { try { & $onDone $out } catch { Log ('后台回调异常 ({0}): {1}' -f $tag, $_.Exception.Message) } }
@@ -286,15 +302,61 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
     }
     try {
         $job = Start-Job -ScriptBlock {
-            param($sliceText, $sb, $args, $consts)
-            Invoke-Expression $sliceText
-            foreach ($k in @($consts.Keys)) {
-                Set-Variable -Name $k -Value $consts[$k] -Scope Script
+            # 注意：Start-Job 的 -ArgumentList 走 PSRemoting 序列化，scriptblock 不能跨进程
+            # 传递——$work 到 job 里只剩 [string] 文本（实机 22:43 实证：& $sb 把文本当
+            # 命令名 → 「无法将...项识别为 cmdlet」）。job 内必须 [scriptblock]::Create 还原。
+            # 另：参数名不能用 $args（自动变量，不绑定位置参数 → workArgs 静默丢失，
+            # sim3 22:45 实证 port 为空），必须用 $workArgs。
+            param($sliceText, $sbText, $workArgs, $consts)
+            # ==== job trace（诊断）：独立文件 logs\tray_job_trace.log，避免与托盘日志抢文件 ====
+            function Trace-Job([string]$m) {
+                try {
+                    [System.IO.File]::AppendAllText(
+                        (Join-Path $consts['LOGDIR'] 'tray_job_trace.log'),
+                        ('{0} [job] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) + [Environment]::NewLine,
+                        [System.Text.Encoding]::UTF8)
+                } catch { }
             }
+            $defVal = ''
+            try { $defVal = [string]$MyInvocation.MyCommand.Definition } catch { $defVal = '<threw>' }
+            if ($defVal.Length -gt 120) { $defVal = $defVal.Substring(0, 120) + '...' }
+            $defVal = $defVal -replace "`r?`n", ' | '
+            Trace-Job ('job start; MyCommand.Definition=[' + $defVal + ']')
+            foreach ($k in @($consts.Keys)) {
+                $v = [string]$consts[$k]
+                if ($v.Length -gt 80) { $v = $v.Substring(0, 80) + '...' }
+                Trace-Job ('consts[' + $k + '] = ' + $v)
+            }
+            # ==== 修复（2026-10-13）：在 IEX 之前、以【当前 scope】注入常量 ====
+            # 旧实现 IEX 之后才 Set-Variable -Scope Script，有两层问题：
+            # ① 切片头部常量块在 job 无文件环境用 $MyInvocation 推导路径必崩（IEX 中断，
+            #    注入循环从未执行）；② 即使 IEX 存活，切片顶层赋值写当前 scope，
+            #    会把 -Scope Script 注入完全遮蔽（沙箱实验实证）。
+            # 现在切片生成器已剔除常量块，这里 IEX 前注入当前 scope —— IEX 定义的
+            # 函数词法父 scope 就是这里，$ROOT 等直接可见。
+            foreach ($k in @($consts.Keys)) {
+                Set-Variable -Name $k -Value $consts[$k]
+            }
+            Trace-Job 'inject-before-IEX done'
+            Trace-Job ('pre-IEX ROOT=[' + $ROOT + '] RUNSERVER=[' + $RUNSERVER + '] PYTHON=[' + $PYTHON + '] PYTHONW=[' + $PYTHONW + ']')
+            try { Invoke-Expression $sliceText; Trace-Job 'IEX ok' }
+            catch {
+                Trace-Job ('IEX FAILED: ' + $_.Exception.Message + ' | at ' + $_.InvocationInfo.PositionMessage)
+                throw
+            }
+            Trace-Job ('post-IEX ROOT=[' + $ROOT + '] RUNSERVER=[' + $RUNSERVER + '] PYTHON=[' + $PYTHON + '] PYTHONW=[' + $PYTHONW + ']')
+            # 还原 work 脚本块（序列化后只剩文本，见函数头注释）
+            $sb = [scriptblock]::Create([string]$sbText)
+            Trace-Job 'enter work'
             # 作业里屏蔽 Log（避免与托盘日志定时器抢文件）；错误经返回值回传
             function Log([string]$m) { }
-            try { return @{ ok = $true; r = (& $sb @args) } }
-            catch { return @{ ok = $false; err = $_ } }
+            try { return @{ ok = $true; r = (& $sb @workArgs) } }
+            catch {
+                # 诊断增强：err 带上出错 cmdlet 的精确位置与调用栈（原实现只存 ErrorRecord，行号全丢）
+                $errInfo = [string]$_.Exception.Message
+                try { $errInfo = ($_.Exception.Message + ' | at ' + $_.InvocationInfo.PositionMessage + ' | ' + $_.ScriptStackTrace) } catch { }
+                return @{ ok = $false; err = $errInfo }
+            }
         } -ArgumentList $slice, $work, $workArgs, $consts
     } catch {
         Log ('后台作业启动失败，退化为同步 ({0}): {1}' -f $tag, $_.Exception.Message)
@@ -303,6 +365,7 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
         if ($onDone) { try { & $onDone $out } catch { } }
         return $true
     }
+    Log ('btn={0} task dispatched timeout={1}s' -f $tag, $timeoutSec)
     $script:BgJobs[$tag] = @{
         job = $job; onDone = $onDone
         started = [DateTime]::UtcNow; timeout = [int]$timeoutSec
@@ -685,6 +748,7 @@ function Refresh-State($data) {
     # UI 线程：只把 $data 画到界面。$data 为空时同步采集（测试/兜底路径）。
     if (-not $data) { $data = Get-StateData }
     $script:LastUp = [bool]$data.up
+    try { Log ('refresh-state called up={0} pid={1}' -f [bool]$data.up, [int]$data.pid) } catch { }
 
     # 图标四态：运行/掉线待自愈/运行但守护暂停/已停止
     $state = 'down'
@@ -808,8 +872,10 @@ $miExit    = $menu.Items.Add('退出（服务保持运行）')
 
 # 服务控制点击：只启动后台任务，UI 线程立即返回（绝不在 UI 线程 Sleep/等网络）
 $miStart.add_Click({
+    Log 'btn=menu-start click'
     $null = Start-BgTask 'srv' {
         param($port)
+        try { Trace-Job 'work: first line (srv)' } catch { }
         $script:Port = [int]$port
         Start-Server
         Start-Sleep -Milliseconds 300
@@ -817,16 +883,20 @@ $miStart.add_Click({
     } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
 })
 $miStop.add_Click({
+    Log 'btn=menu-stop click'
     $null = Start-BgTask 'srv' {
         param($port)
+        try { Trace-Job 'work: first line (srv)' } catch { }
         $script:Port = [int]$port
         Stop-Server
         Get-StateData
     } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
 })
 $miRestart.add_Click({
+    Log 'btn=menu-restart click'
     $null = Start-BgTask 'srv' {
         param($port)
+        try { Trace-Job 'work: first line (srv)' } catch { }
         $script:Port = [int]$port
         Stop-Server
         Start-Sleep -Seconds 1
@@ -911,8 +981,10 @@ function Show-StatusWindow {
         # 按钮：左侧 16px 小图标 + 右侧文字（图标来自 assets\icons\png\16）
         $b1 = New-AbButton $f '启动'       'act_start.png'    14  96
         $b1.add_Click({
+            Log 'btn=window-start click'
             $null = Start-BgTask 'srv' {
                 param($port)
+                try { Trace-Job 'work: first line (srv)' } catch { }
                 $script:Port = [int]$port
                 Start-Server
                 Start-Sleep -Milliseconds 300
@@ -922,8 +994,10 @@ function Show-StatusWindow {
 
         $b2 = New-AbButton $f '停止'       'act_stop.png'     118 96
         $b2.add_Click({
+            Log 'btn=window-stop click'
             $null = Start-BgTask 'srv' {
                 param($port)
+                try { Trace-Job 'work: first line (srv)' } catch { }
                 $script:Port = [int]$port
                 Stop-Server
                 Get-StateData
@@ -932,8 +1006,10 @@ function Show-StatusWindow {
 
         $b3 = New-AbButton $f '重启'       'act_restart.png'  222 96
         $b3.add_Click({
+            Log 'btn=window-restart click'
             $null = Start-BgTask 'srv' {
                 param($port)
+                try { Trace-Job 'work: first line (srv)' } catch { }
                 $script:Port = [int]$port
                 Stop-Server
                 Start-Sleep -Seconds 1
@@ -2330,9 +2406,14 @@ function Update-InstallerUI {
     if ($script:IStatus -ne $null) { $script:IStatus.Text = '正在检测本机软件...' }
     $null = Start-BgTask 'detect' {
         param($mp)
+        try { Trace-Job 'work: first line (detect)' } catch { }
         $script:ManualPaths = $mp
-        $apps = @(Find-AllApps)
-        Update-EditorDaemonConfig $apps
+        # 诊断增强：给两个阶段打 stage 标记（保留原 InvocationInfo，rethrow 不丢位置）
+        $apps = $null
+        try { $apps = @(Find-AllApps) }
+        catch { throw ('[stage=Find-AllApps] ' + $_.Exception.Message + ' | at ' + $_.InvocationInfo.PositionMessage) }
+        try { Update-EditorDaemonConfig $apps }
+        catch { throw ('[stage=Update-EditorDaemonConfig] ' + $_.Exception.Message + ' | at ' + $_.InvocationInfo.PositionMessage) }
         $apps
     } {
         param($d)
@@ -2644,7 +2725,11 @@ $bgTimer.add_Tick({
                 $r = Receive-Job -Job $j.job -ErrorAction Stop
                 if ($r -is [hashtable] -and $r.ContainsKey('ok')) { $out = $r }
                 else { $out = @{ ok = $true; r = $r } }
-            } catch { $out = @{ ok = $false; err = $_ } }
+            } catch {
+                $errInfo = [string]$_.Exception.Message
+                try { $errInfo = ($_.Exception.Message + ' | at ' + $_.InvocationInfo.PositionMessage + ' | ' + $_.ScriptStackTrace) } catch { }
+                $out = @{ ok = $false; err = $errInfo }
+            }
             $finished = $true
         } elseif ((([DateTime]::UtcNow - $j.started).TotalSeconds) -gt $j.timeout) {
             try { Stop-Job $j.job } catch { }
@@ -2653,6 +2738,7 @@ $bgTimer.add_Tick({
             Log ('后台作业超时({0}s): {1}' -f $j.timeout, $tag)
         }
         if ($finished) {
+            try { Log ('btn={0} callback ok={1} err={2}' -f $tag, $out.ok, $out.err) } catch { }
             try { Remove-Job -Job $j.job -Force } catch { }
             $script:BgJobs.Remove($tag)
             if ($j.onDone) {
