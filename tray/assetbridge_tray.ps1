@@ -199,9 +199,6 @@ function Exit-Tray {
         if ($bgTimer  -ne $null) { $bgTimer.Stop() }
     } catch { }
     try { Flush-Log } catch { }
-    if ($script:WorkerSlice -and (Test-Path $script:WorkerSlice)) {
-        try { Remove-Item $script:WorkerSlice -Force -ErrorAction SilentlyContinue } catch { }
-    }
     try { if ($script:Form -ne $null) { $script:Form.Dispose() } } catch { }
     try { $ni.Visible = $false } catch { }
     try { $mutex.ReleaseMutex() } catch { }
@@ -224,20 +221,21 @@ $script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服
 $script:AbNotifyPath = ''  # D3：最近一次 ZBrush 接收的文件路径（气泡点击/菜单复制用）
 
 # ---- 后台任务基础设施（UI 线程永不阻塞） -----------------------------------
-# 原则：点击事件/定时器 tick 里**只启动任务、不等待**；网络、进程、磁盘扫描全部
-# 在独立 runspace 里跑，完成后由 $bgTimer（150ms）把结果投回 UI 线程执行回调。
-$script:BgJobs       = @{}     # tag -> @{ ps; handle; onDone; started; timeout }
-$script:BgPool       = $null
-$script:WorkerSlice  = ''
-$script:LogTimerReady = $false
+# 原则：点击事件里只启动任务、不等待；慢操作（服务启停/检测/下载/安装）在独立
+# **powershell 作业进程**里跑，完成后由 $bgTimer（150ms）把结果投回 UI 线程。
+# 2026-10-13 教训：曾用 runspace 池 + dot-source 切片，切片头部的 Add-Type
+# （编译 C#/加载 WinForms）在 MTA 池线程里直接把任务卡死（state 任务 30s 超时）。
+# Start-Job 是独立进程，没有 MTA/Add-Type 这类问题；切片内容经 Invoke-Expression
+# 在作业里内存态执行（不受执行策略影响，作业进程默认 Restricted）。
+$script:BgJobs           = @{}     # tag -> @{ job; onDone; started; timeout }
+$script:WorkerSliceText  = ''      # 缓存的切片文本（常量+全部函数）
+$script:LogTimerReady    = $false
 
-function Get-WorkerSlice {
-    # 生成「常量 + 全部函数」切片供后台 runspace dot-source。
-    # 做法：head（截到单实例检查之前，避开互斥量/exit）+ AST EndBlock 的**顶层**
+function Get-WorkerSliceText {
+    # 生成「常量 + 全部函数」切片**文本**（不落盘，作业里 Invoke-Expression 用）。
+    # 做法：head（截到单实例检查之前，避开互斥量/exit）+ AST EndBlock 的顶层
     #      函数定义与变量赋值（EndBlock.Statements 只含顶层语句，绝不混入函数体）。
-    # 路径常量（$ROOT/$ScriptDir/...）由 Start-BgTask 在 dot-source 后注入正确值
-    #（runspace 里 $MyInvocation 指向切片文件，不能信切片里的推导）。
-    if ($script:WorkerSlice -and (Test-Path $script:WorkerSlice)) { return $script:WorkerSlice }
+    if ($script:WorkerSliceText) { return $script:WorkerSliceText }
     try {
         $src = [System.IO.File]::ReadAllText($PSCommandPath, [System.Text.Encoding]::UTF8)
         $tokens = $null; $errs = $null
@@ -249,8 +247,6 @@ function Get-WorkerSlice {
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine($n.Extent.Text)
         }
-        # 顶层赋值只从 EndBlock.Statements 取（曾用 Parent 过滤，函数体内的 $pid=0 会泄漏，
-        # 在 runspace 里覆盖只读变量 $PID 直接炸——ParseFile 完全看不出来）
         foreach ($st in $ast.EndBlock.Statements) {
             if ($st -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { continue }
             $t = $st.Extent.Text
@@ -258,43 +254,27 @@ function Get-WorkerSlice {
             [void]$sb.AppendLine('')
             [void]$sb.AppendLine($t)
         }
-        $p = Join-Path $env:TEMP ('AssetBridgeTrayWorker_{0}.ps1' -f $PID)
-        [System.IO.File]::WriteAllText($p, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
-        $script:WorkerSlice = $p
+        $script:WorkerSliceText = $sb.ToString()
     } catch {
         Log ('生成 worker 切片失败: ' + $_.Exception.Message)
     }
-    return $script:WorkerSlice
+    return $script:WorkerSliceText
 }
 
 function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
                      [array]$workArgs = @(), [int]$timeoutSec = 90) {
-    # 启动后台任务。同 tag 不重入；没有 worker 切片（测试/冒烟环境）时退化为同步执行。
-    # 结果经同步哈希表回传，onDone 在 UI 线程（$bgTimer 轮询）被调用：
-    #   @{ ok=$true; r=结果 } 或 @{ ok=$false; err=... }
+    # 启动后台作业。同 tag 不重入；拿不到切片时退化为同步执行（测试/冒烟环境）。
+    # onDone 在 UI 线程（$bgTimer 轮询）被调用，参数 @{ ok=$true; r=结果 }
+    # 或 @{ ok=$false; err=... }。
     if ($script:BgJobs.ContainsKey($tag)) { return $false }
-    $slice = Get-WorkerSlice
+    $slice = Get-WorkerSliceText
     if (-not $slice) {
         $out = @{ ok = $false; err = 'no-worker-slice' }
         try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { $out = @{ ok = $false; err = $_.Exception.Message } }
         if ($onDone) { try { & $onDone $out } catch { Log ('后台回调异常 ({0}): {1}' -f $tag, $_.Exception.Message) } }
         return $true
     }
-    if (-not $script:BgPool) {
-        try {
-            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-            # 注意：工厂静态方法在 RunspaceFactory 上，不在 RunspacePool 上（曾写错，运行时才炸）
-            $script:BgPool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, 2, $iss, $Host)
-            $script:BgPool.Open()
-        } catch {
-            Log ('创建 runspace 池失败，退化为同步: ' + $_.Exception.Message)
-            $out = @{ ok = $false; err = $_.Exception.Message }
-            try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { }
-            if ($onDone) { try { & $onDone $out } catch { } }
-            return $true
-        }
-    }
-    # 路径常量从托盘进程注入（runspace 里不能信切片里的 $MyInvocation 推导）
+    # 路径常量从托盘进程注入（作业进程里不能信切片里的 $MyInvocation 推导）
     $consts = @{
         ROOT = $ROOT; ScriptDir = $ScriptDir; PYTHON = $PYTHON; PYTHONW = $PYTHONW
         RUNSERVER = $RUNSERVER; RUNTIME = $RUNTIME; LOG = $LOG; LOGDIR = $LOGDIR
@@ -304,41 +284,27 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
         ICON_OK = $ICON_OK; ICON_DOWN = $ICON_DOWN; ICON_WARN = $ICON_WARN; ICON_PAUSED = $ICON_PAUSED
         SERVER = $SERVER
     }
-    $sync = [hashtable]::Synchronized(@{})
-    $ps = [PowerShell]::Create()
     try {
-        $null = $ps.RunspacePool = $script:BgPool
-        # 注意：AddArgument 返回 void，必须逐条调用（链式会在第二个调用上炸 null 方法）
-        $null = $ps.AddScript({
-            param($sliceFile, $sb, $args, $consts, $sync)
-            & $sliceFile
+        $job = Start-Job -ScriptBlock {
+            param($sliceText, $sb, $args, $consts)
+            Invoke-Expression $sliceText
             foreach ($k in @($consts.Keys)) {
                 Set-Variable -Name $k -Value $consts[$k] -Scope Script
             }
-            try {
-                $sync.result = (& $sb @args)
-                $sync.ok = $true
-            } catch {
-                $sync.error = $_
-            }
-            $sync.done = $true
-        })
-        $null = $ps.AddArgument($slice)
-        $null = $ps.AddArgument($work)
-        $null = $ps.AddArgument($workArgs)
-        $null = $ps.AddArgument($consts)
-        $null = $ps.AddArgument($sync)
-        $handle = $ps.BeginInvoke()
+            # 作业里屏蔽 Log（避免与托盘日志定时器抢文件）；错误经返回值回传
+            function Log([string]$m) { }
+            try { return @{ ok = $true; r = (& $sb @args) } }
+            catch { return @{ ok = $false; err = $_ } }
+        } -ArgumentList $slice, $work, $workArgs, $consts
     } catch {
-        Log ('后台任务启动失败，退化为同步 ({0}): {1}' -f $tag, $_.Exception.Message)
-        try { $ps.Dispose() } catch { }
+        Log ('后台作业启动失败，退化为同步 ({0}): {1}' -f $tag, $_.Exception.Message)
         $out = @{ ok = $false; err = $_.Exception.Message }
         try { $out = @{ ok = $true; r = (& $work @workArgs) } } catch { }
         if ($onDone) { try { & $onDone $out } catch { } }
         return $true
     }
     $script:BgJobs[$tag] = @{
-        ps = $ps; handle = $handle; sync = $sync; onDone = $onDone
+        job = $job; onDone = $onDone
         started = [DateTime]::UtcNow; timeout = [int]$timeoutSec
     }
     return $true
@@ -347,15 +313,10 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
 function Stop-BgTasks {
     foreach ($tag in @($script:BgJobs.Keys)) {
         $j = $script:BgJobs[$tag]
-        try { $j.ps.Stop() } catch { }
-        try { $j.ps.Dispose() } catch { }
+        try { Stop-Job  $j.job } catch { }
+        try { Remove-Job $j.job -Force } catch { }
     }
     $script:BgJobs = @{}
-    if ($script:BgPool) {
-        try { $script:BgPool.Close() } catch { }
-        try { $script:BgPool.Dispose() } catch { }
-        $script:BgPool = $null
-    }
 }
 $script:PidCache   = @{ pid = 0; ts = 0 }   # Get-ServerPid 的缓存（见该函数内的性能说明）
 # 手动指定的软件路径 { key -> exe / 引擎根目录 }，持久化在 tray_config.json 的 manual_paths。
@@ -2641,19 +2602,13 @@ function Show-Installer {
 }
 
 # ---- 自检定时器 -----------------------------------------------------------
-# tick 里只启动后台任务（探测/自愈/状态采集），UI 线程零阻塞。
+# state 采集是有界的（Test-Server 带 1s 超时 + 代理绕过，掉线最坏 ~1.2s），
+# 放在 UI 线程同步跑——这是 2026-10-13 前验证过多个月的行为，不做无谓的异步化
+# （runspace 异步版曾把 state 卡死 30s，见 Start-BgTask 注释）。
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $script:Interval * 1000
 $timer.add_Tick({
-    $null = Start-BgTask 'state' {
-        param($guard, $port)
-        $script:Guard = [bool]$guard
-        $script:Port  = [int]$port
-        Get-StateData
-    } {
-        param($d)
-        if ($d.ok) { Refresh-State $d.r } else { Log ('状态采集失败: ' + $d.err) }
-    } @($script:Guard, $script:Port) 30
+    Refresh-State
     # D3：ZBrush 落盘通知（守护进程写 notify.json -> 气泡展示路径，点击复制，10s 自动消失）
     try {
         $nf = Join-Path $EDITOR_STATE 'notify.json'
@@ -2675,7 +2630,7 @@ $logTimer = New-Object System.Windows.Forms.Timer
 $logTimer.Interval = 500
 $logTimer.add_Tick({ Flush-Log })
 
-# 后台任务回收定时器：150ms 轮询同步哈希表，完成后在 UI 线程执行回调（含超时强停）
+# 后台作业回收定时器：150ms 轮询作业状态，完成后在 UI 线程执行回调（含超时强停）
 $bgTimer = New-Object System.Windows.Forms.Timer
 $bgTimer.Interval = 150
 $bgTimer.add_Tick({
@@ -2683,20 +2638,22 @@ $bgTimer.add_Tick({
         $j = $script:BgJobs[$tag]
         $out = $null
         $finished = $false
-        if ($j.sync.done) {
-            if ($j.sync.ok) { $out = @{ ok = $true; r = $j.sync.result } }
-            else { $out = @{ ok = $false; err = $j.sync.error } }
+        $state = $j.job.State
+        if ($state -eq 'Completed' -or $state -eq 'Failed' -or $state -eq 'Stopped') {
+            try {
+                $r = Receive-Job -Job $j.job -ErrorAction Stop
+                if ($r -is [hashtable] -and $r.ContainsKey('ok')) { $out = $r }
+                else { $out = @{ ok = $true; r = $r } }
+            } catch { $out = @{ ok = $false; err = $_ } }
             $finished = $true
         } elseif ((([DateTime]::UtcNow - $j.started).TotalSeconds) -gt $j.timeout) {
-            try { $j.ps.Stop() } catch { }
+            try { Stop-Job $j.job } catch { }
             $out = @{ ok = $false; err = 'TIMEOUT' }
             $finished = $true
-            Log ('后台任务超时({0}s): {1}' -f $j.timeout, $tag)
+            Log ('后台作业超时({0}s): {1}' -f $j.timeout, $tag)
         }
         if ($finished) {
-            # EndInvoke 只做尽力回收（PS 5.1 对跨线程 EndInvoke 有坑，结果以 sync 为准）
-            try { $null = $j.ps.EndInvoke($j.handle) } catch { }
-            try { $j.ps.Dispose() } catch { }
+            try { Remove-Job -Job $j.job -Force } catch { }
             $script:BgJobs.Remove($tag)
             if ($j.onDone) {
                 try { & $j.onDone $out } catch { Log ('后台回调异常 ({0}): {1}' -f $tag, $_.Exception.Message) }
@@ -2716,16 +2673,8 @@ $bgTimer.Start()
 $script:LogTimerReady = $true
 Log ('托盘启动 port={0} interval={1}' -f $script:Port, $script:Interval)
 
-# 启动时状态采集也走后台（含服务未运行时的自动拉起），UI 立即可见
-$null = Start-BgTask 'state' {
-    param($guard, $port)
-    $script:Guard = [bool]$guard
-    $script:Port  = [int]$port
-    Get-StateData
-} {
-    param($d)
-    if ($d.ok) { Refresh-State $d.r } else { Log ('启动状态采集失败: ' + $d.err) }
-} @($script:Guard, $script:Port) 30
+# 启动时状态采集：有界同步（Test-Server 1s 超时；服务未运行时由守护自动拉起）
+Refresh-State
 $ni.Visible = $true
 $timer.Start()
 
