@@ -3,7 +3,8 @@
 #
 #  * 常驻系统托盘，没有任何窗口
 #  * 图标四态：绿=运行中 / 琥珀=掉线(守护会自动拉起) / 灰=运行中但守护暂停 / 红=已停止
-#  * 右键菜单：启动 / 停止 / 重启 / 暂停守护 / 打开日志 / 打开项目文件夹 / 设置 / 退出
+#  * 右键菜单：启动 / 停止 / 重启 / 暂停守护 / 编辑器守护（PS/SAI2 回传）/
+#    打开日志 / 打开项目文件夹 / 设置 / 安装插件 / 退出
 #  * 双击图标 = 打开状态小窗（关闭后缩回托盘，不退出）
 #  * 每隔 N 秒自检，服务掉了自动拉起（可用"暂停守护"关掉）
 #  * 由 assetbridge_tray_launch.vbs 以「窗口样式 0」启动（零窗口，无 cmd 常驻）
@@ -35,6 +36,10 @@ $PYTHONW   = Join-Path (Split-Path -Parent $PYTHON) 'pythonw.exe'
 $SERVER    = Join-Path $ROOT 'server\server.py'
 $RUNSERVER = Join-Path $ScriptDir 'run_server.py'
 $RUNTIME   = Join-Path $ROOT 'runtime'
+# PS / SAI2 外部编辑器守护进程（保存贴图后自动回传给发送端）
+$EDITOR_DAEMON = Join-Path $ROOT 'tools\editor_daemon.py'
+$EDITOR_CFG    = Join-Path $ROOT 'tools\editor_daemon.json'
+$EDITOR_STATE  = Join-Path $RUNTIME 'editor_daemon'   # pid / stop.flag / status.json
 $LOGDIR    = Join-Path $ROOT 'logs'
 $LOG       = Join-Path $LOGDIR 'tray.log'
 $SRVLOG    = Join-Path $LOGDIR 'server_console.log'
@@ -402,6 +407,83 @@ function Stop-Server {
     }
 }
 
+# ---- 编辑器守护进程（PS / SAI2：打开贴图 -> 监听保存 -> 自动回传）----------
+# 与中转服务解耦：服务挂了不影响它，它挂了也不影响各 DCC 正常收发。
+# 状态来源：runtime\editor_daemon\ 下的 daemon.pid / status.json。
+function Get-EditorDaemonPid {
+    $pf = Join-Path $EDITOR_STATE 'daemon.pid'
+    if (-not (Test-Path $pf)) { return 0 }
+    $dv = 0
+    try { $dv = [int]((Get-Content $pf -Raw -Encoding UTF8).Trim()) } catch { return 0 }
+    if ($dv -le 0) { return 0 }
+    try {
+        $proc = Get-Process -Id $dv -ErrorAction Stop
+        if ($proc.ProcessName -match 'python') { return $dv }
+    } catch { }
+    return 0
+}
+function Test-EditorDaemon { return ((Get-EditorDaemonPid) -gt 0) }
+function Start-EditorDaemon {
+    if (Test-EditorDaemon) { Log '编辑器守护启动跳过：已在运行'; return }
+    if (-not (Test-Path $EDITOR_DAEMON)) { Log ('编辑器守护启动失败：缺 ' + $EDITOR_DAEMON); return }
+    try {
+        # 与中转服务同样的拉法：pythonw 零窗口、与托盘进程解耦
+        $exe = $PYTHONW
+        if (-not (Test-Path $exe)) { $exe = $PYTHON }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName         = $exe
+        $psi.Arguments        = ('-u "{0}"' -f $EDITOR_DAEMON)
+        $psi.WorkingDirectory = $ROOT
+        $psi.WindowStyle      = 'Hidden'
+        $psi.UseShellExecute  = $false
+        $psi.CreateNoWindow   = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        Log ('已启动编辑器守护 pid={0}（PS/SAI2 贴图自动回传）' -f $p.Id)
+    } catch { Log ('启动编辑器守护失败: {0}' -f $_) }
+}
+function Stop-EditorDaemon {
+    $p = Get-EditorDaemonPid
+    if ($p -le 0) {
+        # 清掉可能残留的 pid 文件（进程已死但文件还在）
+        $pf = Join-Path $EDITOR_STATE 'daemon.pid'
+        if (Test-Path $pf) { try { Remove-Item $pf -Force -ErrorAction SilentlyContinue } catch { } }
+        Log '编辑器守护停止跳过：未在运行'
+        return
+    }
+    # 写 stop.flag：守护进程主循环每轮检查，干净退出（绝不杀用户的 PS/SAI2）
+    try {
+        if (-not (Test-Path $EDITOR_STATE)) { New-Item -ItemType Directory -Path $EDITOR_STATE -Force | Out-Null }
+        [System.IO.File]::WriteAllText((Join-Path $EDITOR_STATE 'stop.flag'), (Get-Date).ToString('s'))
+        Log ('已向编辑器守护发送停止指令 pid={0}' -f $p)
+    } catch { Log ('写 stop.flag 失败: {0}' -f $_) }
+    # 等最多 10 秒（保存回传中的 watch 需要时间收尾）；没退成再强杀兜底
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 400
+        if (-not (Test-EditorDaemon)) { Log '编辑器守护已停止'; return }
+    }
+    try {
+        Stop-Process -Id $p -Force -ErrorAction Stop
+        Log ('已强制停止编辑器守护 pid={0}' -f $p)
+    } catch {
+        Log ('强杀编辑器守护失败 pid={0}: {1}（可能不是本会话拉起，可 taskkill /F /PID {0}）' -f $p, $_.Exception.Message)
+    }
+}
+function Get-EditorDaemonStatusText {
+    # 菜单 / 状态窗共用的一句话状态
+    $p = Get-EditorDaemonPid
+    if ($p -le 0) { return '编辑器守护：未运行' }
+    $extra = ''
+    $sf = Join-Path $EDITOR_STATE 'status.json'
+    if (Test-Path $sf) {
+        try {
+            $st = Get-Content $sf -Raw -Encoding UTF8 | ConvertFrom-Json
+            $w = @($st.watching).Count
+            if ($w -gt 0) { $extra = ('，监听中 {0} 个文件' -f $w) }
+        } catch { }
+    }
+    return ('编辑器守护：运行中 pid={0}{1}' -f $p, $extra)
+}
+
 # ---- 界面 -----------------------------------------------------------------
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -469,6 +551,12 @@ function Refresh-State {
         }
     }
     if ($script:StatusLabel -ne $null) { Update-StatusWindow }
+
+    # 编辑器守护（PS/SAI2）状态：菜单文字 + 按钮可用性
+    $script:LastEdUp = (Test-EditorDaemon)
+    if ($miEdState -ne $null) { $miEdState.Text = (Get-EditorDaemonStatusText) }
+    if ($miEdStart -ne $null) { $miEdStart.Enabled = (-not $script:LastEdUp) }
+    if ($miEdStop  -ne $null) { $miEdStop.Enabled  = $script:LastEdUp }
 }
 
 function Update-StatusWindow {
@@ -494,6 +582,11 @@ function Update-StatusWindow {
             }
         } catch { }
     }
+    if ($script:EdLabel -ne $null) {
+        $edUp = (Test-EditorDaemon)
+        $script:EdLabel.Text = (Get-EditorDaemonStatusText)
+        $script:EdLabel.ForeColor = if ($edUp) { [System.Drawing.Color]::FromArgb(30, 130, 60) } else { [System.Drawing.Color]::FromArgb(120, 120, 120) }
+    }
 }
 
 # ---- 右键菜单 -------------------------------------------------------------
@@ -507,6 +600,11 @@ $miStop    = $menu.Items.Add('停止服务')
 $miRestart = $menu.Items.Add('重启服务')
 [void]$menu.Items.Add('-')
 $miGuard   = $menu.Items.Add('暂停守护')
+[void]$menu.Items.Add('-')
+$miEdState  = $menu.Items.Add('编辑器守护：检查中...')
+$miEdState.Enabled = $false
+$miEdStart  = $menu.Items.Add('启动编辑器守护（PS/SAI2 回传）')
+$miEdStop   = $menu.Items.Add('停止编辑器守护')
 [void]$menu.Items.Add('-')
 $miLog     = $menu.Items.Add('打开托盘日志')
 $miSrvLog  = $menu.Items.Add('打开服务日志')
@@ -528,6 +626,8 @@ $miGuard.add_Click({
     if ($script:Guard) { $miGuard.Text = '暂停守护'; Log '守护已恢复' } else { $miGuard.Text = '恢复守护'; Log '守护已暂停' }
     Refresh-State
 })
+$miEdStart.add_Click({ Start-EditorDaemon; Start-Sleep -Milliseconds 600; Refresh-State })
+$miEdStop.add_Click({  Stop-EditorDaemon;  Start-Sleep -Milliseconds 400; Refresh-State })
 $miLog.add_Click({    Start-Process -FilePath 'notepad.exe' -ArgumentList $LOG })
 $miSrvLog.add_Click({ Start-Process -FilePath 'notepad.exe' -ArgumentList $SRVLOG })
 $miFolder.add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList $ROOT })
@@ -564,8 +664,14 @@ function Show-StatusWindow {
         $script:StatusLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
         $f.Controls.Add($script:StatusLabel)
 
+        # 第二行：编辑器守护（PS/SAI2）状态
+        $script:EdLabel = New-Object System.Windows.Forms.Label
+        $script:EdLabel.SetBounds(14, 36, 530, 16)
+        $script:EdLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+        $f.Controls.Add($script:EdLabel)
+
         $script:LogBox = New-Object System.Windows.Forms.TextBox
-        $script:LogBox.SetBounds(14, 46, 530, 216)
+        $script:LogBox.SetBounds(14, 56, 530, 208)
         $script:LogBox.Multiline   = $true
         $script:LogBox.ReadOnly    = $true
         $script:LogBox.WordWrap    = $true    # 日志自动换行
@@ -719,16 +825,23 @@ $MIN_MAYA     = '2023'
 $MIN_SP       = '10.0.1'
 $MIN_SP_BUILD = 3757
 $MIN_UE       = '5.8'
+$MIN_TOOLBAG  = '5.0'   # 适配器用的是 Toolbag 5 的 mset API
 
 # 本机把 DCC 都装在各自盘的 DCC 目录下（用户习惯），一并纳入自动检测范围
 $DCC_ROOTS = @('D:\DCC', 'G:\DCC', 'E:\DCC', 'C:\DCC')
 
-# 安装器支持的四类软件（k=key / n=报告里显示名 / s=按钮短名 / src=本仓库插件源相对路径）
+# 安装器支持的软件（k=key / n=报告里显示名 / s=按钮短名 / src=本仓库插件源相对路径）
+#   - blender / maya / sp / ue / toolbag：有插件要装（src 指向插件目录）
+#   - photoshop / sai2：**不需要装插件**——贴图由「编辑器守护进程」直接调用 exe 打开，
+#     保存后自动回传。这里纳入只是为了检测 + 手动指定路径（同步进 editor_daemon.json）。
 $AB_APPS_META = @(
-    @{ k='blender'; n='Blender';           s='Blender'; src='plugins/blender/asset_bridge_blender' },
-    @{ k='maya';    n='Maya';              s='Maya';    src='plugins/maya/asset_bridge_maya' },
-    @{ k='sp';      n='Substance Painter'; s='SP';      src='plugins/substance_painter/asset-bridge' },
-    @{ k='ue';      n='Unreal Engine';     s='UE';      src='plugins/unreal/AssetBridge' }
+    @{ k='blender';    n='Blender';           s='Blender';    src='plugins/blender/asset_bridge_blender' },
+    @{ k='maya';       n='Maya';              s='Maya';       src='plugins/maya/asset_bridge_maya' },
+    @{ k='sp';         n='Substance Painter'; s='SP';         src='plugins/substance_painter/asset-bridge' },
+    @{ k='ue';         n='Unreal Engine';     s='UE';         src='plugins/unreal/AssetBridge' },
+    @{ k='toolbag';    n='Marmoset Toolbag';  s='Toolbag';    src='plugins/toolbag/asset_bridge' },
+    @{ k='photoshop';  n='Photoshop';         s='PS';         src='' },
+    @{ k='sai2';       n='SAI2';              s='SAI2';       src='' }
 )
 
 function Parse-Version([string]$s) {
@@ -1243,9 +1356,88 @@ function Find-Unreal {
         src='plugins/unreal/AssetBridge'; targets=$targets; ok=$true; note=''
     }
 }
+function Find-ExeInRoots([string[]]$roots, [string]$leaf) {
+    # 各根目录的一级子目录下找 $leaf（本机安装习惯：<盘>\DCC\<软件目录>\<exe>）
+    $out = @()
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+            $c = Join-Path $d.FullName $leaf
+            if (Test-Path $c) { $out += $c }
+        }
+    }
+    return $out
+}
+function Find-ExeOnPath([string]$leaf) {
+    $out = @()
+    if ($env:Path) {
+        $env:Path -split ';' | Where-Object { $_ } | ForEach-Object {
+            $c = Join-Path $_ $leaf
+            if (Test-Path $c) { $out += $c }
+        }
+    }
+    return $out
+}
+function Find-Toolbag {
+    # Toolbag 5：插件放 <安装目录>\data\plugin\asset_bridge\（__main__.py 自动加载）
+    $exes  = @(Find-ExeInRoots $DCC_ROOTS 'toolbag.exe')
+    $exes += Find-ExeDeep $DCC_ROOTS 'toolbag.exe' 3
+    $exes += Find-ExeViaShortcut 'toolbag\.exe$'
+    $exes += Find-ExeOnPath 'toolbag.exe'
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $ver = Get-ExeVer $e
+        if (-not $ver -and ($e -match '(\d+(?:\.\d+)+)'))   { $ver = $Matches[1] }
+        if (-not $ver -and ($e -match 'Toolbag[ _-]?(\d+)')) { $ver = $Matches[1] }
+        if (-not $ver) { $ver = '5.0' }   # 目录名/文件都读不到版本时按 5.x 兜底
+        if (-not (Ver-GE $ver $MIN_TOOLBAG)) { continue }
+        return [PSCustomObject]@{
+            key='toolbag'; name='Marmoset Toolbag'; version=$ver; path=$e; min=$MIN_TOOLBAG;
+            src='plugins/toolbag/asset_bridge';
+            targets=@((Join-Path (Split-Path $e) 'data\plugin\asset_bridge'));
+            ok=$true; note=''
+        }
+    }
+    return $null
+}
+function Find-Photoshop {
+    # PS 不装插件（编辑器守护外部调用），这里只负责检测 + 记录路径
+    $exes  = @(Find-ExeInRoots ($DCC_ROOTS + @('C:\Program Files\Adobe')) 'Photoshop.exe')
+    $exes += Find-ExeDeep @('C:\Program Files\Adobe') 'Photoshop.exe' 2
+    $exes += Find-ExeViaShortcut 'Photoshop\.exe$'
+    $exes += Find-ExeOnPath 'Photoshop.exe'
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $ver = Get-ExeVer $e
+        if (-not $ver -and ($e -match '(\d{4})')) { $ver = $Matches[1] }
+        $note = ''
+        if (-not $ver) { $ver = '未知'; $note = '未能读取版本信息（不影响使用）' }
+        return [PSCustomObject]@{
+            key='photoshop'; name='Photoshop'; version=$ver; path=$e; min='不限';
+            src=''; targets=@(); ok=$true; note=$note; noinstall=$true
+        }
+    }
+    return $null
+}
+function Find-Sai2 {
+    # SAI2 同 PS：不装插件，编辑器守护外部调用
+    $exes  = @(Find-ExeInRoots $DCC_ROOTS 'sai2.exe')
+    $exes += Find-ExeDeep $DCC_ROOTS 'sai2.exe' 3
+    $exes += Find-ExeViaShortcut 'sai2\.exe$'
+    $exes += Find-ExeOnPath 'sai2.exe'
+    foreach ($e in @($exes | Sort-Object -Unique)) {
+        $ver = Get-ExeVer $e
+        $note = ''
+        if (-not $ver) { $ver = '2.x'; $note = '未能读取版本信息（SAI2 一般不写版本号），按可用处理' }
+        return [PSCustomObject]@{
+            key='sai2'; name='SAI2'; version=$ver; path=$e; min='不限';
+            src=''; targets=@(); ok=$true; note=$note; noinstall=$true
+        }
+    }
+    return $null
+}
 function Find-AllApps {
     $det = @()
-    foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal')) {
+    foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal',
+                     'Find-Toolbag','Find-Photoshop','Find-Sai2')) {
         try {
             $r = & $fn
             if ($r) { $det += $r }
@@ -1291,9 +1483,51 @@ function Copy-Plugin([string]$src, [string]$dst, [string]$label, $app) {
         return "已安装 $label -> $dst"
     } catch { return "安装失败 $label : $_" }
 }
+function Update-EditorDaemonConfig {
+    # 把检测到 / 手动指定的 PS、SAI2 路径同步进 tools\editor_daemon.json
+    #（守护进程从这里读 exe；找不到的键保留原值，绝不删）。
+    # 手动指定优先于自动检测——用户显式选过的路径就是最终意愿。
+    $cfgPath = Join-Path $ROOT 'tools\editor_daemon.json'
+    $data = $null
+    if (Test-Path $cfgPath) {
+        try { $data = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $data = $null }
+    }
+    $apps = @{}
+    if ($data -and $data.apps) {
+        foreach ($p in @($data.apps.PSObject.Properties)) { $apps[$p.Name] = [string]$p.Value }
+    }
+    $changed = $false
+    foreach ($k in @('photoshop', 'sai2')) {
+        $exe = ''
+        if ($script:ManualPaths.ContainsKey($k)) { $exe = [string]$script:ManualPaths[$k] }
+        if (-not $exe) {
+            $a = $null
+            if ($script:IApps) { $a = $script:IApps | Where-Object { $_.key -eq $k } | Select-Object -First 1 }
+            if ($a -and $a.ok -and $a.path) { $exe = [string]$a.path }
+        }
+        if ($exe -and (Test-Path -LiteralPath $exe) -and $apps[$k] -ne $exe) {
+            $apps[$k] = $exe
+            $changed = $true
+        }
+    }
+    if (-not $changed) { return }
+    $srv = 'http://127.0.0.1:27631'
+    if ($data -and $data.server_url) { $srv = [string]$data.server_url }
+    $out = [ordered]@{ server_url = $srv; apps = $apps }
+    try {
+        [System.IO.File]::WriteAllText($cfgPath, ($out | ConvertTo-Json),
+            (New-Object System.Text.UTF8Encoding($false)))
+        Log ('已同步编辑器守护配置: ' + $cfgPath)
+    } catch { Log ('写 editor_daemon.json 失败: {0}' -f $_) }
+}
 function Install-App($app) {
     if (-not $app) { return '未检测到该软件（请用下方「指定」按钮手动选择路径）' }
     if ($app.ok -eq $false) { return "无法安装：$($app.note)" }
+    if ($app.noinstall) {
+        # PS / SAI2 不装插件：把路径同步进守护配置即完成「安装」
+        Update-EditorDaemonConfig
+        return ($app.name + ' 无需安装插件：贴图会由「编辑器守护」调用本程序打开，保存后自动回传（路径已同步）')
+    }
     $targets = @($app.targets)
     if ($targets.Count -eq 0) { return '没有可用的安装目标，请重新检测' }
     $src = Get-AppSourceDir $app.src
@@ -1355,15 +1589,21 @@ function Resolve-ManualApp([string]$key, [string]$path) {
         'maya'    { $src = 'plugins/maya/asset_bridge_maya' }
         'sp'      { $src = 'plugins/substance_painter/asset-bridge' }
         'ue'      { $src = 'plugins/unreal/AssetBridge' }
+        'toolbag' { $src = 'plugins/toolbag/asset_bridge' }
+        'photoshop' { $src = '' }
+        'sai2'      { $src = '' }
         default   { return $null }
     }
     # 允许直接给安装目录：替他找目录下的可执行文件
     if (Test-Path -LiteralPath $path -PathType Container) {
         $leaf = switch ($key) {
-            'blender' { 'blender.exe' }
-            'maya'    { 'maya.exe' }
-            'sp'      { 'Adobe Substance 3D Painter.exe' }
-            default   { '' }
+            'blender'    { 'blender.exe' }
+            'maya'       { 'maya.exe' }
+            'sp'         { 'Adobe Substance 3D Painter.exe' }
+            'toolbag'    { 'toolbag.exe' }
+            'photoshop'  { 'Photoshop.exe' }
+            'sai2'       { 'sai2.exe' }
+            default      { '' }
         }
         if ($leaf) {
             $hit = $null
@@ -1450,6 +1690,44 @@ function Resolve-ManualApp([string]$key, [string]$path) {
                 targets=@(Join-Path $path 'Engine\Plugins\AssetBridge')
             }
         }
+        'toolbag' {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'toolbag.exe') { return $null }
+            $ver = Get-ExeVer $path
+            if (-not $ver -and ($path -match '(\d+(?:\.\d+)+)'))    { $ver = $Matches[1] }
+            if (-not $ver -and ($path -match 'Toolbag[ _-]?(\d+)')) { $ver = $Matches[1] }
+            if (-not $ver) { $ver = '5.0' }
+            $ok = (Ver-GE $ver $MIN_TOOLBAG)
+            $note = if ($ok) { '' } else { "版本过低或无法识别（需 >= $MIN_TOOLBAG）" }
+            return [PSCustomObject]@{
+                key='toolbag'; name='Marmoset Toolbag'; version=$ver; path=$path; min=$MIN_TOOLBAG;
+                src=$src; ok=$ok; note=$note;
+                targets=@((Join-Path (Split-Path $path) 'data\plugin\asset_bridge'))
+            }
+        }
+        'photoshop' {
+            # 不装插件：只校验 exe 存在，路径随后同步进 editor_daemon.json
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'Photoshop.exe') { return $null }
+            $ver = Get-ExeVer $path
+            $note = ''
+            if (-not $ver) { $ver = '未知'; $note = '未能读取版本信息（不影响使用）' }
+            return [PSCustomObject]@{
+                key='photoshop'; name='Photoshop'; version=$ver; path=$path; min='不限';
+                src=''; ok=$true; note=$note; targets=@(); noinstall=$true
+            }
+        }
+        'sai2' {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'sai2.exe') { return $null }
+            $ver = Get-ExeVer $path
+            $note = ''
+            if (-not $ver) { $ver = '2.x'; $note = '未能读取版本信息（SAI2 一般不写版本号），按可用处理' }
+            return [PSCustomObject]@{
+                key='sai2'; name='SAI2'; version=$ver; path=$path; min='不限';
+                src=''; ok=$true; note=$note; targets=@(); noinstall=$true
+            }
+        }
     }
     return $null
 }
@@ -1508,14 +1786,32 @@ function Request-ManualPath([string]$key) {
             $fbd.ShowNewFolderButton = $false
             if ($fbd.ShowDialog() -eq 'OK') { $path = $fbd.SelectedPath }
         }
+        'toolbag' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'Marmoset Toolbag|toolbag.exe'
+            $ofd.Title  = '选择 toolbag.exe（Toolbag 5）'
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
+        }
+        'photoshop' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'Photoshop|Photoshop.exe'
+            $ofd.Title  = '选择 Photoshop.exe'
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
+        }
+        'sai2' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'SAI2|sai2.exe'
+            $ofd.Title  = '选择 sai2.exe'
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
+        }
     }
     if (-not $path) { return $null }
     $app = Resolve-ManualApp $key $path
     if (-not $app) {
         [System.Windows.Forms.MessageBox]::Show(
-            ('路径无效：未能在该路径找到有效的程序。' + "`n" + $path +
-             "`n`nBlender / Maya / Substance Painter 请选择对应的 .exe；UE 请选择引擎根目录。"),
-            '路径无效', 'OK', 'Warning') | Out-Null
+                ('路径无效：未能在该路径找到有效的程序。' + "`n" + $path +
+                 "`n`nBlender / Maya / Substance Painter / Toolbag / Photoshop / SAI2 请选择对应的 .exe；UE 请选择引擎根目录。"),
+                '路径无效', 'OK', 'Warning') | Out-Null
         return $null
     }
     if (-not $app.ok) {
@@ -1557,6 +1853,7 @@ function Update-InstallerUI {
             continue
         }
         $st   = Get-InstallState $a
+        if ($a.noinstall) { $st.text = '无需安装插件（由编辑器守护调用）' }
         $flag = if ($a.ok) { '✓ 可安装' } else { '✗ 不可安装' }
         $lines += ("{0,-18} {1,-10} [{2}] {3}" -f $meta.n, ('v' + $a.version), $flag, $st.text)
         if ($a.path) { $lines += ("   程序: " + $a.path) }
@@ -1568,7 +1865,9 @@ function Update-InstallerUI {
         foreach ($t in @($a.targets)) { $lines += ("   安装到: " + $t) }
         if ($ib) {
             $ib.Enabled = [bool]$a.ok
-            $ib.Text = $(if ($st.installed) { '更新 ' + $meta.s } else { '安装 ' + $meta.s })
+            $ib.Text = $(if ($a.noinstall) { '同步 ' + $meta.s }
+                        elseif ($st.installed) { '更新 ' + $meta.s }
+                        else { '安装 ' + $meta.s })
         }
         if ($ub) { $ub.Enabled = [bool]$st.installed }
         $lines += ''
@@ -1576,12 +1875,14 @@ function Update-InstallerUI {
     if ($script:InstallSource) { $lines += ("安装源: " + $script:InstallSource) }
     else { $lines += ('安装源: ' + $ROOT + '\plugins（本仓库）') }
     if ($script:IReport) { $script:IReport.Text = [string]::Join([Environment]::NewLine, $lines) }
+    # 检测/指定完 PS、SAI2 后，把路径同步进编辑器守护配置（有变化才写盘）
+    Update-EditorDaemonConfig
 }
 
 function Show-Installer {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Asset Bridge 插件安装器'
-    $form.ClientSize = New-Object System.Drawing.Size(560, 588)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 726)
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
@@ -1608,46 +1909,59 @@ function Show-Installer {
     $bUninstall = @{}
     $bManual = @{}
 
+    # 按钮统一参数：一行 4 个（宽 132 + 间隔 4），7 个软件自动换行
+    $btnX0 = 14; $btnStep = 136; $btnW = 132; $btnH = 30
+    $colCount = 4
+
     $lbl1 = New-Object System.Windows.Forms.Label
-    $lbl1.Text = '一键安装 / 更新（检测到且版本达标时可用）：'; $lbl1.SetBounds(14, 382, 532, 18)
+    $lbl1.Text = '一键安装 / 更新（检测到且版本达标时可用；PS/SAI2 为「同步守护配置」）：'; $lbl1.SetBounds(14, 382, 532, 18)
     $form.Controls.Add($lbl1)
-    $xs = @(14, 150, 286, 422)
+    $idx = 0
     foreach ($meta in $AB_APPS_META) {
+        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
+        $by = 404 + (38 * [int]($idx / $colCount))
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = '安装 ' + $meta.s; $b.SetBounds($xs[0], 400, 132, 30); $xs[0] += 136
+        $b.Text = '安装 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
         $b.Enabled = $false
         $b.Tag = $meta.k
         $bInstall[$meta.k] = $b
         $form.Controls.Add($b)
+        $idx++
     }
 
     $lbl2 = New-Object System.Windows.Forms.Label
-    $lbl2.Text = '卸载插件（先备份到 backups/，可回滚）：'; $lbl2.SetBounds(14, 436, 532, 18)
+    $lbl2.Text = '卸载插件（先备份到 backups/，可回滚）：'; $lbl2.SetBounds(14, 486, 532, 18)
     $form.Controls.Add($lbl2)
-    $xs = @(14, 150, 286, 422)
+    $idx = 0
     foreach ($meta in $AB_APPS_META) {
+        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
+        $by = 508 + (38 * [int]($idx / $colCount))
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = '卸载 ' + $meta.s; $b.SetBounds($xs[0], 454, 132, 30); $xs[0] += 136
+        $b.Text = '卸载 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
         $b.Enabled = $false
         $b.Tag = $meta.k
         $bUninstall[$meta.k] = $b
         $form.Controls.Add($b)
+        $idx++
     }
 
     $lbl3 = New-Object System.Windows.Forms.Label
-    $lbl3.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl3.SetBounds(14, 490, 532, 18)
+    $lbl3.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl3.SetBounds(14, 590, 532, 18)
     $form.Controls.Add($lbl3)
-    $xs = @(14, 150, 286, 422)
+    $idx = 0
     foreach ($meta in $AB_APPS_META) {
+        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
+        $by = 612 + (38 * [int]($idx / $colCount))
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = '指定 ' + $meta.s; $b.SetBounds($xs[0], 508, 132, 30); $xs[0] += 136
+        $b.Text = '指定 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
         $b.Tag = $meta.k
         $bManual[$meta.k] = $b
         $form.Controls.Add($b)
+        $idx++
     }
 
     $bClose = New-Object System.Windows.Forms.Button
-    $bClose.Text = '关闭'; $bClose.SetBounds(232, 546, 96, 30)
+    $bClose.Text = '关闭'; $bClose.SetBounds(232, 682, 96, 30)
     $bClose.add_Click({ $form.Close() })
     $form.Controls.Add($bClose)
 

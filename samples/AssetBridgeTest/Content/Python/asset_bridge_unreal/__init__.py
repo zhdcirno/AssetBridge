@@ -80,13 +80,35 @@ def route_profile(src: str) -> Dict:
     return _profiles().get("routes", {}).get(f"{src}>unreal", {})
 
 
+# 引擎版本必须在**游戏线程**读取：unreal.SystemLibrary 是 UE API，在后台 worker
+# 线程里调用会抛 "Attempted to access Unreal API from outside the main game thread"。
+# 而 client() 首次是在后台轮询线程（或 asset-bridge-send 线程）里被调用的 ——
+# 所以这里预先缓存版本号（模块导入 & start() 都发生在游戏线程），client() 只读缓存。
+_engine_version_cache: Optional[str] = None
+
+
+def _read_engine_version() -> str:
+    """读引擎版本（UE API，仅可在游戏线程调用）。非游戏线程时返回占位符而不是抛错。"""
+    try:
+        return unreal.SystemLibrary.get_engine_version()
+    except Exception:
+        return "unknown"
+
+
+def _engine_version() -> str:
+    global _engine_version_cache
+    if _engine_version_cache is None:
+        _engine_version_cache = _read_engine_version()
+    return _engine_version_cache
+
+
 def client() -> BridgeClient:
     global _client
     if _client is None:
         _client = BridgeClient(
             base_url=CONFIG["server_url"],
             app="unreal",
-            version=unreal.SystemLibrary.get_engine_version(),
+            version=_engine_version(),
             project=CONFIG["project"],
         )
     return _client
@@ -204,8 +226,14 @@ def _handle(record: dict) -> None:
                 "message": imported.get("message", ""),
             }
         elif kind == "textures":
-            paths = importer.import_textures(record, files)
-            result = {"assets": paths, "message": f"导入 {len(paths)} 张贴图"}
+            opts = record.get("options") or {}
+            if opts.get("return_of"):
+                # PS / SAI2 保存回传：覆盖原 Texture2D 资产（引用不丢）
+                paths = importer.reload_textures(record, files, opts)
+                result = {"assets": paths, "message": f"保存后重载 {len(paths)} 张贴图"}
+            else:
+                paths = importer.import_textures(record, files)
+                result = {"assets": paths, "message": f"导入 {len(paths)} 张贴图"}
         else:
             fbx = [f for f in files if f.lower().endswith((".fbx", ".obj"))]
             if not fbx:
@@ -255,7 +283,12 @@ def _on_tick(delta_time: float) -> None:
 def start(**overrides) -> None:
     global _worker, _tick_handle, _stop_event
     global _fail_streak, _next_poll_ts, _last_fail_log_ts, _circuit_open, _last_probe_ts
+    global _engine_version_cache
     CONFIG.update({k: v for k, v in overrides.items() if k in CONFIG})
+
+    # 游戏线程：刷新引擎版本缓存 —— 后台 worker / 发送线程里的 client() 只读缓存，
+    # 绝不能在那里调 unreal.SystemLibrary（会抛 outside the main game thread）。
+    _engine_version_cache = _read_engine_version()
 
     # 幂等守卫：已有存活 worker 则先彻底停掉旧实例，避免线程 / tick 回调泄漏
     if _worker is not None and _worker.is_alive():
@@ -301,12 +334,16 @@ def stop() -> None:
 # ---------------------------------------------------------------------------
 
 
-def send_selected_assets(target_app: str = "blender", note: str = "") -> int:
+def send_selected_assets(target_app: str = "blender", note: str = "",
+                         mode: str = "update") -> int:
     """把内容浏览器里选中的资产发到目标软件。
 
     游戏线程只做「选中查询 + 本地导出」（UE 资产导出 API 必须在游戏线程），
     网络部分（建 transfer / 落盘中转目录或上传 / publish）全部丢到后台线程，
     避免服务器没开时菜单点击被同步 HTTP 超时卡住 2~3 秒。
+
+    mode: Toolbag 目标时传 bake/render（Toolbag 适配器据此分流）；其他目标
+          保持 update（覆盖更新）。
     """
     paths = exporter.selected_asset_paths()
     if not paths:
@@ -338,7 +375,7 @@ def send_selected_assets(target_app: str = "blender", note: str = "") -> int:
         "format": "fbx",
         "to": {"app": target_app, "project": CONFIG["project"], "content_path": ""},
         "unit": {"scene_unit": "cm", "up_axis": "Z", "forward_axis": "X", "unit_scale": 1.0},
-        "options": {"mode": "update"},
+        "options": {"mode": mode},
         "objects": [{"name": Path(p).name, "type": "ASSET"} for p in paths],
         "note": note,
     }
@@ -379,6 +416,60 @@ def _send_bg(target_app: str, meta: dict, files: list, work_dir: str) -> None:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def send_selected_textures(target_app: str = "photoshop", note: str = "") -> int:
+    """把内容浏览器里选中的 Texture2D 导出 PNG，发到 Photoshop / SAI2。
+
+    只能发贴图（PS/SAI2 不接收模型）。options 里带 asset_paths / source_files，
+    编辑器保存后守护进程原样带回，UE 侧按文件名映射覆盖原资产（reload_textures）。
+    游戏线程只做导出，网络丢后台线程。
+    """
+    if target_app not in ("photoshop", "sai2"):
+        unreal.log_warning("[bridge] 贴图发送只支持 photoshop / sai2")
+        return 0
+    paths = exporter.selected_asset_paths()
+    if not paths:
+        unreal.log_warning("[bridge] 内容浏览器里没有选中资产")
+        return 0
+
+    import tempfile
+    import shutil
+    work_dir = tempfile.mkdtemp(prefix="ab_tex_")
+    try:
+        pairs = exporter.export_textures(paths, work_dir)
+    except Exception as exc:
+        unreal.log_error(f"[bridge] 贴图导出失败: {exc}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return 0
+    if not pairs:
+        unreal.log_warning("[bridge] 选中的资产里没有 Texture2D（或导出失败）")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        return 0
+
+    files = [f for _p, f in pairs]
+    raw_name = Path(pairs[0][0]).name
+    asset_name = _to_ascii(raw_name) if _to_ascii else raw_name
+    meta = {
+        "asset_name": asset_name,
+        "kind": "textures",
+        "format": "png",
+        "to": {"app": target_app, "project": CONFIG["project"], "content_path": ""},
+        "options": {
+            "editor": target_app,
+            # 文件 -> 原资产 的对应关系，保存回传时按文件名映射覆盖
+            "asset_paths": [p for p, _f in pairs],
+            "source_files": [Path(f).name for _p, f in pairs],
+        },
+        "objects": [{"name": Path(p).name, "type": "TEXTURE"} for p, _f in pairs],
+        "note": note,
+    }
+    threading.Thread(
+        target=_send_bg, name="asset-bridge-send",
+        args=(target_app, meta, files, work_dir), daemon=True
+    ).start()
+    unreal.log(f"[bridge] 正在后台推送 {len(files)} 张贴图 -> {target_app} …")
+    return len(files)
 
 
 def import_local_groom(abc_path: str, asset_name: str = "", content_path: str = "/Game/Bridge/Groom") -> Dict:

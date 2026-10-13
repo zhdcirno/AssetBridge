@@ -1,5 +1,8 @@
 ﻿{
     "port":  27631,
     "interval":  10,
-    "payload_dir":  "E:\\CirnoWorkSpace\\AssetBridge\\runtime\\payloads"
+    "payload_dir":  "E:\\CirnoWorkSpace\\AssetBridge\\runtime\\payloads",
+    "manual_paths":  {
+                         "maya":  "G:\\DCC\\Maya2023\\Maya2023\\bin\\maya.exe"
+                     }
 }

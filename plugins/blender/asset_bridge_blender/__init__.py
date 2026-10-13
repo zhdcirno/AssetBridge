@@ -22,7 +22,7 @@ bl_info = {
     "version": (0, 1, 0),
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar > Asset Bridge",
-    "description": "与 UE / Maya / Substance Painter 互发模型、贴图与骨架",
+    "description": "与 UE / Maya / Substance Painter / Toolbag / Photoshop / SAI2 互发模型、贴图与骨架",
     "category": "Import-Export",
 }
 
@@ -60,9 +60,21 @@ class BridgeAddonPreferences(bpy.types.AddonPreferences):
             ("unreal", "Unreal Engine", "发送到 UE"),
             ("maya", "Maya", "发送到 Maya"),
             ("substance_painter", "Substance Painter", "发送到 SP"),
+            ("toolbag", "Marmoset Toolbag", "发送到 Toolbag（烘焙/渲染）"),
+            ("photoshop", "Photoshop", "发送贴图到 PS，保存后自动重载"),
+            ("sai2", "SAI2", "发送贴图到 SAI2，保存后自动重载"),
             ("blender", "Blender", "发给另一个 Blender 实例"),
         ],
         default="unreal",
+    )
+    toolbag_mode: bpy.props.EnumProperty(
+        name="Toolbag 模式",
+        items=[
+            ("bake", "烘焙", "导入高低模、建烘焙组并烘焙，贴图回传 SP"),
+            ("render", "渲染", "只导入模型/材质，用于渲染"),
+        ],
+        default="bake",
+        description="仅当目标软件为 Marmoset Toolbag 时有效",
     )
     send_mode: bpy.props.EnumProperty(
         name="模式",

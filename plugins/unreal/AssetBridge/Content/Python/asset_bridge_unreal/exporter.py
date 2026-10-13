@@ -85,3 +85,39 @@ def export_assets(asset_paths: List[str], out_dir: str, profile: Dict) -> List[s
     if not ok:
         unreal.log_warning("[bridge] 部分资产导出失败，请检查 Output Log")
     return [f for f in written if Path(f).exists()]
+
+
+def export_textures(asset_paths: List[str], out_dir: str) -> List[tuple]:
+    """把选中的 Texture2D 导出为 PNG，返回 [(资产包路径, 文件绝对路径)]。
+
+    只有 Texture2D 会被导出；选中里混着网格等其他资产时自动跳过。
+    导出的文件名 = 资产名 + .png，编辑器守护进程靠它和原资产对应。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for p in asset_paths:
+        asset = unreal.EditorAssetLibrary.load_asset(p)
+        if asset is None:
+            unreal.log_warning(f"[bridge] 资产不存在: {p}")
+            continue
+        if not isinstance(asset, unreal.Texture2D):
+            continue
+        name = Path(p).name
+        fp = out_dir / f"{name}.png"
+        task = unreal.AssetExportTask()
+        task.set_editor_property("object", asset)
+        task.set_editor_property("filename", str(fp))
+        task.set_editor_property("automated", True)
+        task.set_editor_property("prompt", False)
+        task.set_editor_property("replace_identical", True)
+        try:
+            unreal.Exporter.run_asset_export_tasks([task])
+        except Exception as exc:
+            unreal.log_warning(f"[bridge] 贴图导出失败 {p}: {exc}")
+            continue
+        if fp.exists():
+            out.append((p, str(fp)))
+        else:
+            unreal.log_warning(f"[bridge] 贴图导出未生成文件: {p}")
+    return out

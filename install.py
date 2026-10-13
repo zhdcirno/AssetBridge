@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """Asset Bridge 一键安装器 (One-click installer).
 
-把四套 DCC 适配器（Blender / Maya / Substance Painter / Unreal）部署到本机各
-软件，并生成中转服务的启动脚本 start_bridge_server.bat。
+把 DCC 适配器部署到本机各软件，并生成中转服务的启动脚本 start_bridge_server.bat：
+  - Blender / Maya / Substance Painter / Unreal：复制插件到各自用户/引擎目录
+  - Marmoset Toolbag 5：复制插件到 <安装目录>\\data\\plugin\\asset_bridge
+  - Photoshop / SAI2：不装插件，仅把 exe 路径同步进 tools\\editor_daemon.json
+    （贴图由「编辑器守护进程」调用本程序打开，保存后自动回传）
+
 
 用法:
     python install.py            # 实际执行部署
@@ -31,6 +35,7 @@
 
 import argparse
 import datetime
+import json
 import os
 import re
 import winreg
@@ -101,6 +106,28 @@ MAYA_MARKERS = ["# >>> asset-bridge shelf >>>"]
 
 SP_SRC = os.path.join(PROJECT_ROOT, "plugins", "substance_painter", "asset-bridge")
 SP_DST = r"C:\Users\12069\Documents\Adobe\Adobe Substance 3D Painter\plugins\asset-bridge"
+
+# Toolbag 5：复制插件到 <安装目录>\data\plugin\asset_bridge（__main__.py 自动加载）
+TOOLBAG_SRC = os.path.join(PROJECT_ROOT, "plugins", "toolbag", "asset_bridge")
+TOOLBAG_EXE_CANDIDATES = [
+    r"D:\DCC\Toolbag 5\toolbag.exe",
+    r"G:\DCC\Toolbag 5\toolbag.exe",
+    r"E:\DCC\Toolbag 5\toolbag.exe",
+]
+
+# Photoshop / SAI2 不装插件：仅把 exe 路径同步进守护配置（守护进程据此调用打开）
+EDITOR_DAEMON_CFG = os.path.join(PROJECT_ROOT, "tools", "editor_daemon.json")
+DCC_ROOTS = [r"D:\DCC", r"G:\DCC", r"E:\DCC", r"C:\DCC", r"C:\Program Files\Adobe"]
+EDITOR_EXE_CANDIDATES = {
+    "photoshop": [
+        r"C:\Program Files\Adobe\Adobe Photoshop 2023\Photoshop.exe",
+        r"D:\DCC\Adobe Photoshop 2023\Photoshop.exe",
+    ],
+    "sai2": [
+        r"D:\DCC\[Saier]SAI Ver.2\sai2.exe",
+        r"G:\DCC\[Saier]SAI Ver.2\sai2.exe",
+    ],
+}
 
 # UE：引擎级插件（装到 <UE安装目录>/Engine/Plugins/AssetBridge，对所有工程通用）
 UE_PLUGIN_SRC = os.path.join(PROJECT_ROOT, "plugins", "unreal", "AssetBridge")
@@ -333,6 +360,81 @@ class Installer:
     def install_substance_painter(self):
         self.safe_copy_dir(SP_SRC, SP_DST)
 
+    # -- 检测器（限深扫描，避免在大目录上拖慢安装器） ------------------------
+    @staticmethod
+    def _scan_for_exe(name, roots, max_depth=4):
+        name_l = name.lower()
+        for r in roots:
+            if not os.path.isdir(r):
+                continue
+            for dp, dirs, fns in os.walk(r):
+                depth = dp[len(r):].count(os.sep)
+                if depth > max_depth:
+                    del dirs[:]
+                    continue
+                for f in fns:
+                    if f.lower() == name_l:
+                        return os.path.join(dp, f)
+        return None
+
+    def _detect_toolbag_exe(self):
+        for c in TOOLBAG_EXE_CANDIDATES:
+            if os.path.isfile(c):
+                return c
+        return self._scan_for_exe("toolbag.exe", DCC_ROOTS)
+
+    def _detect_editor_exe(self, key):
+        for c in EDITOR_EXE_CANDIDATES.get(key, []):
+            if os.path.isfile(c):
+                return c
+        subdir = r"C:\Program Files\Adobe" if key == "photoshop" else None
+        roots = ([subdir] if subdir else []) + DCC_ROOTS
+        return self._scan_for_exe(
+            "Photoshop.exe" if key == "photoshop" else "sai2.exe", roots
+        )
+
+    def install_toolbag(self):
+        """复制 Toolbag 适配器到 <安装目录>\\data\\plugin\\asset_bridge。"""
+        exe = self._detect_toolbag_exe()
+        if not exe:
+            self.log("SKIP", "未检测到 Marmoset Toolbag 5（可手动指定后由托盘安装器部署）。")
+            return
+        target = os.path.join(os.path.dirname(exe), "data", "plugin", "asset_bridge")
+        self.safe_copy_dir(TOOLBAG_SRC, target)
+
+    def sync_editor_daemon_config(self):
+        """把检测到的 PS / SAI2 路径同步进 tools\\editor_daemon.json（守护进程读取）。
+
+        仅更新 apps 下 photoshop / sai2 两个键，保留 server_url 与其它已有键，绝不整文件覆盖。
+        """
+        cfg_path = EDITOR_DAEMON_CFG
+        data = {}
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        apps = dict(data.get("apps", {}))
+        changed = False
+        for key in ("photoshop", "sai2"):
+            exe = self._detect_editor_exe(key)
+            if exe and os.path.isfile(exe) and apps.get(key) != exe:
+                apps[key] = exe
+                changed = True
+        if not changed:
+            self.log("SKIP", "editor_daemon.json 无需更新。")
+            return
+        data["server_url"] = data.get("server_url", "http://127.0.0.1:27631")
+        data["apps"] = apps
+        self._backup_if_exists(cfg_path)
+        if self.dry_run:
+            self.log("PLAN", "更新编辑器守护配置: " + cfg_path)
+            return
+        self._write_text(cfg_path, json.dumps(data, indent=2, ensure_ascii=False))
+        self.changes.append(cfg_path)
+        self.log("OK", "已同步编辑器守护配置: " + cfg_path)
+
     def install_unreal(self):
         """把 AssetBridge 作为引擎级插件装到每个检测到的 UE 引擎：
 
@@ -439,7 +541,9 @@ class Installer:
             ("Blender 适配器", self.install_blender),
             ("Maya 适配器", self.install_maya),
             ("Substance Painter 适配器", self.install_substance_painter),
+            ("Marmoset Toolbag 适配器", self.install_toolbag),
             ("Unreal 适配器", self.install_unreal),
+            ("同步编辑器守护配置(PS/SAI2)", self.sync_editor_daemon_config),
             ("部署守护脚本(watchdog)", self.install_watchdog),
         ]
         for name, fn in steps:

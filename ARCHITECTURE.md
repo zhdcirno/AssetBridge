@@ -1,7 +1,9 @@
 # Asset Bridge 架构设计
 
 > 目标：让 Blender / Unreal / Maya / Substance Painter 之间**一键互发模型**，  
-> 并且带上材质槽、UV、骨架，保留变换与单位，重复发送时更新同名资产而不是堆 `SM_Chair_1`。
+> 并扩展支持 **Marmoset Toolbag 5**（烘焙 / 渲染）与 **Photoshop / SAI2**（贴图编辑：  
+> 其它软件把贴图发过去，**保存后自动回传**），带上材质槽、UV、骨架，保留变换与单位，  
+> 重复发送时更新同名资产而不是堆 `SM_Chair_1`。
 
 ---
 
@@ -13,6 +15,10 @@
 │  (bpy)   │  │ (unreal) │  │ (cmds)   │  │  (JS / QML)       │
 └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────────┬─────────┘
      │             │             │                  │
+┌────┴─────┐  ┌────┴───────┐     │                  │
+│ Toolbag  │  │ PS / SAI2  │     │                  │
+│  (mset)  │  │ (守护进程)  │     │                  │
+└────┬─────┘  └────┬───────┘     │                  │
      └─────────────┴──────┬──────┴──────────────────┘
                           │  HTTP / JSON（仅本机 127.0.0.1:27631）
                           ▼
@@ -28,6 +34,11 @@
                             ├── SM_Chair.fbx
                             └── （贴图等）
 ```
+
+> **编辑器守护进程**（`tools/editor_daemon.py`）：Photoshop / SAI2 没有可编程 API，  
+> 因此由托盘拉起一个独立守护进程——轮询 inbox → 认领 → 调用 exe 打开贴图 → 监听文件  
+> 保存稳定 → 建 `kind=textures` 回传 transfer（并合并原 options 的 `return_of` / `source_file` 等）  
+> → 触发发送端在原资产上原地重载。守护与中转服务解耦：服务挂了不影响它，它挂了也不影响各 DCC。
 
 **为什么是「本地中转服务 + 文件」，而不是点对点直连：**
 
@@ -165,9 +176,10 @@ FBX 天然携带材质槽、UV 集、顶点色、骨骼层级，不需要自己�
 
 `tray/AssetBridge-Tray.vbs` 启动托盘 → 右键 **安装插件...**：
 
-1. **探测**：对四个软件分别跑多源探测——PATH / `Get-Command` / 环境变量（`MAYA_LOCATION`、`DCC_ROOTS`）/
+1. **探测**：对七个软件分别跑多源探测——PATH / `Get-Command` / 环境变量（`MAYA_LOCATION`、`DCC_ROOTS`）/
    App Paths 注册表 / 卸载注册表 / Autodesk 注册表 / 文件关联 / 快捷方式 / 各盘 DCC 目录限深扫描。
-2. **版本门槛**：Blender ≥ 5.0、Maya ≥ 2023、SP ≥ 10.0.1（build 3757）、UE ≥ 5.8，不达标不可安装。
+2. **版本门槛**：Blender ≥ 5.0、Maya ≥ 2023、SP ≥ 10.0.1（build 3757）、UE ≥ 5.8、Toolbag ≥ 5.0；
+   Photoshop / SAI2 不限版本（只校验 exe 存在，不装插件，路径同步进 `tools/editor_daemon.json`）。
 3. **部署**：复制到各软件的插件目录（UE 为引擎级插件），先备份旧版到 `backups/install_*`，绝不就地改名。
 4. **状态判断**：安装完成后写 `.assetbridge.json` 指纹卡片，据此显示 未安装 / 已安装（最新）/ 可重装。
 5. **手动指定兜底**：探测不到的软件可「指定」路径；**指定一次即持久化**到
@@ -205,6 +217,32 @@ python server/server.py --root runtime --port 27631
 `Documents/Adobe/Adobe Substance 3D Painter/plugins/`。  
 ⚠️ SP **不做插件热重载**：改了 `main.qml` 必须重启 SP 才生效。
 
+### Marmoset Toolbag 5
+
+`plugins/toolbag/asset_bridge` 整个文件夹拷到 `<Toolbag 安装目录>\data\plugin\asset_bridge`  
+（Toolbag 会自动扫描 `data/plugin/<文件夹>/__main__.py` 并加载）。插件通过 `mset.callbacks.onPeriodicUpdate`
+轮询 inbox：收到模型时按发送端标注的 **bake / render** 模式分流——
+
+- **烘焙模式**：`baker.addGroup(name)` 建烘焙组，`baker.importModel(path)` 让快速加载器自动归类高/低模，
+  跑 `mset.baking.bake()`，完成后把烘焙贴图作为 `kind=textures` 回传给 **SP**（暂只支持发 SP）。
+- **渲染模式**：只 `mset.importModel / importMaterial / frameObject` 导入模型与材质，不烘焙。
+
+⚠️ Toolbag 的 `bake()` 是异步的，完成判定用「输出目录出现新文件且 mtime 稳定」法（轮询确认）。
+
+### Photoshop / SAI2（编辑器守护）
+
+这两个软件**不装插件**——它们没有可编程 API，无法像其它适配器那样主动收发。流程改为：
+
+1. 发送端（Blender / Maya / UE）把贴图发往 `photoshop` / `sai2`；
+2. 托盘拉起的**编辑器守护进程**（`tools/editor_daemon.py`）认领后，用 `subprocess.Popen([exe, 文件])`
+   打开该贴图文件；
+3. 守护进程监听文件 mtime/大小 + 同目录新图片（覆盖另存为）变化，稳定后建 `kind=textures` 回传 transfer，
+   并把原 transfer 的 `options`（`return_of` / `source_file` / `editor` 等）合并回去；
+4. 发送端在对应资产上**原地重载**贴图（引用不丢）；
+5. 用户未保存直接关闭 → 宽限后按 `cancelled` 收尾。
+
+安装器里 Photoshop / SAI2 的「安装」按钮只是把 exe 路径同步进 `tools/editor_daemon.json`（标 `无需安装插件`）。
+
 ### 托盘自身的设置
 
 右键托盘 → **设置**：服务端口、自检间隔、中转文件路径。中转路径旁可「打开文件夹」或
@@ -218,12 +256,14 @@ python server/server.py --root runtime --port 27631
 | 模块          | 状态                                     |
 | ----------- | -------------------------------------- |
 | 中转服务        | ✅ 完成，16 项冒烟测试全通过                       |
-| Blender 适配器 | ✅ 骨架完成（发送 / 接收 / 面板 / 定时器）             |
-| UE 适配器      | ✅ 骨架完成（自动导入 / 摆放 / 回发），引擎级插件安装          |
-| Maya 适配器    | 🟡 骨架完成，实机待验证（commandPort 驱动）              |
-| SP 适配器      | 🟡 骨架完成，部分 API 需按本机版本核对（见代码 `[待本机验证]`） |
-| 托盘守护        | ✅ 完成（四态图标 / 看门狗自动拉起 / HTTP 优雅关服）         |
-| 插件安装器       | ✅ 完成（多源探测 / 版本门槛 / 安装·更新·卸载 / 手动路径记忆 / GitHub 下载） |
+| Blender 适配器 | ✅ 完成（发送 / 接收 / 面板 / 定时器 / 发贴图到编辑器 / 保存重载） |
+| UE 适配器      | ✅ 完成（自动导入 / 摆放 / 回发 / 发贴图到编辑器 / 原地重载），引擎级插件安装 |
+| Maya 适配器    | ✅ 完成（发送 / 接收 / 发贴图到编辑器 / 重载），userSetup 自启 |
+| SP 适配器      | ✅ 完成（接收模型 / 回传贴图 / 接收 `kind=textures` / 回传目标含 PS·SAI2） |
+| Toolbag 适配器  | ✅ 完成（bake / render 两模式；烘焙回传 SP）            |
+| 编辑器守护进程    | ✅ 完成（PS/SAI2 打开贴图 → 监听保存 → 自动回传 + 重载）     |
+| 托盘守护        | ✅ 完成（四态图标 / 看门狗自动拉起 / HTTP 优雅关服 / 编辑器守护菜单） |
+| 插件安装器       | ✅ 完成（七软件多源探测 / 版本门槛 / 安装·更新·卸载 / 手动路径记忆 / GitHub 下载 / Toolbag 部署） |
 
 下一步建议（按性价比排序）：
 

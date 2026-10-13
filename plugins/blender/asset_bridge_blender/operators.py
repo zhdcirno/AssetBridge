@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """插件的所有 Operator，以及定时器实际执行的收发逻辑。"""
+import os
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 
 import bpy
 
@@ -151,7 +152,7 @@ class BRIDGE_OT_send_selection(bpy.types.Operator):
                 "unit_scale": profile.get("export", {}).get("global_scale", 1.0),
             },
             "options": {
-                "mode": prefs.send_mode,
+                "mode": prefs.toolbag_mode if target == "toolbag" else prefs.send_mode,
                 "import_materials": prefs.import_materials,
                 "import_textures": prefs.import_textures,
                 "combine_meshes": prefs.combine_meshes,
@@ -199,14 +200,238 @@ class BRIDGE_OT_send_selection(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
+# 发送贴图（给 Photoshop / SAI2 用：只能发贴图，保存后自动重载）
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXTS = (".png", ".psd", ".tga", ".jpg", ".jpeg", ".bmp", ".exr",
+               ".tif", ".tiff")
+
+
+def _gather_images(context) -> List["bpy.types.Image"]:
+    """收集要发送的贴图：优先选中对象材质里的 Image Texture 节点，
+    没有选中/没有节点贴图时退化为场景里所有 FILE 来源的图片。"""
+    seen, out = set(), []
+    for obj in list(getattr(context, "selected_objects", []) or []):
+        for slot in getattr(obj, "material_slots", []) or []:
+            mat = getattr(slot, "material", None)
+            if mat is None or not getattr(mat, "use_nodes", False):
+                continue
+            for node in mat.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and node.image is not None:
+                    if node.image.name not in seen:
+                        seen.add(node.image.name)
+                        out.append(node.image)
+    if not out:
+        for img in bpy.data.images:
+            if getattr(img, "source", "") == "FILE" and img.name not in seen:
+                seen.add(img.name)
+                out.append(img)
+    return out
+
+
+def _resolve_image_file(img, tmpdir: str) -> Optional[Path]:
+    """把 Image 解析成磁盘上的真实文件。
+
+    文件来源直接用；打包图片尝试存一份到临时目录；都不行返回 None。
+    """
+    try:
+        fp = bpy.path.abspath(img.filepath) if img.filepath else ""
+    except Exception:
+        fp = ""
+    if fp and os.path.isfile(fp):
+        return Path(fp)
+    if getattr(img, "packed_file", None) is not None:
+        name = (img.name or "packed").strip() or "packed"
+        if not name.lower().endswith(_IMAGE_EXTS):
+            name += ".png"
+        dst = Path(tmpdir) / name
+        try:
+            img.save_reload(str(dst))
+            if dst.is_file():
+                return dst
+        except Exception:
+            pass
+    return None
+
+
+class BRIDGE_OT_send_textures(bpy.types.Operator):
+    bl_idname = "bridge.send_textures"
+    bl_label = "发送贴图到编辑器"
+    bl_description = ("把选中对象用到的贴图文件发给 Photoshop / SAI2；"
+                      "在编辑器里保存后，Blender 侧自动重新加载")
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        prefs = _prefs()
+        target = prefs.target_app
+        if target not in ("photoshop", "sai2"):
+            self.report({"WARNING"}, "贴图发送只支持 Photoshop / SAI2")
+            return {"CANCELLED"}
+
+        images = _gather_images(context)
+        if not images:
+            self.report({"WARNING"},
+                        "没有找到可发送的贴图（选中带贴图材质的对象，或场景里先有图片）")
+            return {"CANCELLED"}
+
+        skipped: List[str] = []
+        files: List[Path] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for img in images:
+                fp = _resolve_image_file(img, tmp)
+                if fp is None:
+                    skipped.append(img.name)
+                else:
+                    files.append(fp)
+            if not files:
+                self.report({"ERROR"},
+                            "这些贴图都没有磁盘文件（打包图片请先保存到磁盘）: "
+                            + "、".join(skipped))
+                return {"CANCELLED"}
+
+            # 资产名：场景里填了就用场景的，否则用第一张图的名字
+            scene_name = (getattr(context.scene, "bridge_asset_name", "") or "").strip()
+            first = files[0]
+            base = scene_name or first.stem
+            asset_name = _clean_name(base)
+            ext = first.suffix.lstrip(".").lower() or "png"
+
+            try:
+                client = _client()
+                rec = client.send(
+                    {
+                        "asset_name": asset_name,
+                        "kind": "textures",
+                        "format": ext,
+                        "to": {"app": target, "project": prefs.project,
+                               "content_path": ""},
+                        "options": {"editor": target},
+                        "note": (getattr(context.scene, "bridge_note", "") or ""),
+                    },
+                    files,
+                    use_direct_write=prefs.direct_write,
+                )
+            except BridgeError as exc:
+                self.report({"ERROR"}, str(exc))
+                return {"CANCELLED"}
+            except Exception as exc:
+                self.report({"ERROR"}, f"发送失败: {type(exc).__name__}: {exc}")
+                return {"CANCELLED"}
+
+        msg = f"已发送 {len(files)} 张贴图 -> {target}（{asset_name}，保存后自动重载）"
+        if skipped:
+            msg += "；跳过无文件: " + "、".join(skipped)
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
 # 接收
 # ---------------------------------------------------------------------------
+
+
+def _find_image_by_source(source_file: str):
+    """按原始文件名在已载入图片里找对应 Image（供保存后重载用）。
+
+    两轮匹配：先按「文件路径 basename」精确找（最强信号，避免被同名
+    新载入图片 shadow），找不到再按 Image 名找。
+    """
+    if not source_file:
+        return None
+    stem = os.path.splitext(source_file)[0]
+    for img in bpy.data.images:
+        try:
+            fp = bpy.path.abspath(img.filepath) if img.filepath else ""
+        except Exception:
+            fp = ""
+        if fp and os.path.basename(fp) == source_file:
+            return img
+    for img in bpy.data.images:
+        if img.name == source_file or img.name == stem:
+            return img
+    return None
+
+
+def _import_textures(full: dict) -> Tuple[str, dict]:
+    """接收贴图传输。
+
+    - 普通贴图（如 Toolbag→Blender，暂未启用）：直接载入为新图片
+    - options.return_of（PS/SAI2 保存回传）：找到原图 datablock 改 filepath +
+      reload()，材质节点全部自动跟上（同一个 Image 数据块）
+    """
+    files = [f for f in (full.get("_files_abs") or [])
+             if f.lower().endswith(_IMAGE_EXTS)]
+    if not files:
+        return "error", {"message": f"transfer {full['id']} 里没有图片文件"}
+
+    opts = full.get("options") or {}
+    return_of = opts.get("return_of")
+    source_file = str(opts.get("source_file") or "")
+    editor = str(opts.get("editor") or (full.get("from") or {}).get("app") or "")
+
+    reloaded, loaded, failed = [], [], []
+    for f in files:
+        name = os.path.basename(f)
+        img = _find_image_by_source(source_file) if return_of else None
+        if img is not None:
+            try:
+                img.filepath = f
+                img.reload()
+                reloaded.append(img.name)
+                continue
+            except Exception as exc:
+                failed.append(f"{name}: {exc}")
+                continue
+        try:
+            new = bpy.data.images.load(f, check_existing=True)
+            loaded.append(new.name)
+        except Exception as exc:
+            failed.append(f"{name}: {exc}")
+
+    if reloaded and not loaded and not failed:
+        return "done", {
+            "message": f"{editor or '编辑器'} 保存后已重载: " + "、".join(reloaded),
+            "reloaded": reloaded,
+        }
+    if loaded and not failed:
+        return "done", {
+            "message": "已载入贴图: " + "、".join(loaded),
+            "images": loaded,
+        }
+    if failed:
+        return "error", {"message": "部分贴图处理失败: " + "；".join(failed)}
+    return "error", {"message": "没有可处理的贴图文件"}
+
+
+def _import_model(full: dict) -> Tuple[str, dict]:
+    files = full.get("_files_abs") or []
+    fbx_files = [f for f in files if f.lower().endswith((".fbx", ".obj"))]
+    if not fbx_files:
+        return "error", {"message": f"transfer {full['id']} 里没有可导入的模型文件"}
+    src_app = (full.get("from") or {}).get("app", "unreal")
+    profile = bridge_state.route_profile(src_app, "blender")
+    imported = []
+    for f in fbx_files:
+        imported += io_fbx.import_fbx(f, profile)
+    return "done", {
+        "objects": [o.name for o in imported],
+        "message": io_fbx.last_import_report(imported),
+    }
+
+
+def _import_record(full: dict) -> Tuple[str, dict]:
+    """主线程调用：按 kind 分发导入（模型 / 贴图）。返回 (status, result)。"""
+    kind = str(full.get("kind", "")).lower()
+    if kind == "textures":
+        return _import_textures(full)
+    return _import_model(full)
 
 
 def poll_and_import(max_items: int = 5) -> int:
     """拉 inbox 并导入。返回值是成功处理的条数。
 
-    只能在主线程（timer）里调用 —— 里面全是 bpy 操作。
+    只能在主线程（timer / Operator）里调用 —— 里面全是 bpy 操作。
+    网络上报（finish）交给后台线程，主线程零网络 IO。
     """
     prefs = _prefs()
     client = _client()
@@ -225,29 +450,14 @@ def poll_and_import(max_items: int = 5) -> int:
             continue
 
         try:
-            files = full.get("_files_abs") or []
-            fbx_files = [f for f in files if f.lower().endswith((".fbx", ".obj"))]
-            if not fbx_files:
-                raise RuntimeError(f"transfer {full['id']} 里没有可导入的模型文件")
-
-            src_app = (full.get("from") or {}).get("app", "unreal")
-            profile = bridge_state.route_profile(src_app, "blender")
-            imported = []
-            for f in fbx_files:
-                imported += io_fbx.import_fbx(f, profile)
-
-            client.finish(
-                full["id"],
-                "done",
-                {
-                    "objects": [o.name for o in imported],
-                    "message": io_fbx.last_import_report(imported),
-                },
-            )
+            status, result = _import_record(full)
+            _result_queue.put((full["id"], status, result))
             handled += 1
-            print(f"[bridge] 收到 {full['asset_name']}（来自 {src_app}，第 {full['revision']} 版）")
+            print(f"[bridge] 收到 {full.get('asset_name')}"
+                  f"（{full.get('kind')}，来自 {(full.get('from') or {}).get('app')}）")
         except Exception as exc:
-            client.finish(full["id"], "error", {"message": f"{type(exc).__name__}: {exc}"})
+            _result_queue.put((full["id"], "error",
+                               {"message": f"{type(exc).__name__}: {exc}"}))
             print(f"[bridge] 导入失败: {exc}")
 
     if handled:
@@ -413,20 +623,10 @@ def _on_net_failure(msg):
 def _import_one(full):
     """主线程调用：执行 bpy 导入，把结果放回 _result_queue 交由后台上报。"""
     try:
-        files = full.get("_files_abs") or []
-        fbx_files = [f for f in files if f.lower().endswith((".fbx", ".obj"))]
-        if not fbx_files:
-            raise RuntimeError(f"transfer {full['id']} 里没有可导入的模型文件")
-        src_app = (full.get("from") or {}).get("app", "unreal")
-        profile = bridge_state.route_profile(src_app, "blender")
-        imported = []
-        for f in fbx_files:
-            imported += io_fbx.import_fbx(f, profile)
-        _result_queue.put((full["id"], "done", {
-            "objects": [o.name for o in imported],
-            "message": io_fbx.last_import_report(imported),
-        }))
-        print(f"[bridge] 收到 {full.get('asset_name')}（来自 {src_app}）")
+        status, result = _import_record(full)
+        _result_queue.put((full["id"], status, result))
+        print(f"[bridge] 收到 {full.get('asset_name')}"
+              f"（{full.get('kind')}，来自 {(full.get('from') or {}).get('app')}）")
     except Exception as exc:
         _result_queue.put((full["id"], "error", {"message": f"{type(exc).__name__}: {exc}"}))
         print(f"[bridge] 导入失败: {exc}")
@@ -518,6 +718,7 @@ class BRIDGE_OT_pause(bpy.types.Operator):
 CLASSES = [
     BRIDGE_OT_test_connection,
     BRIDGE_OT_send_selection,
+    BRIDGE_OT_send_textures,
     BRIDGE_OT_pull_now,
     BRIDGE_OT_open_payload_dir,
     BRIDGE_OT_start,

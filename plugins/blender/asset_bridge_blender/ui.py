@@ -68,18 +68,33 @@ class BRIDGE_PT_panel(bpy.types.Panel):
 
         row = box.row()
         row.prop(prefs, "target_app", text="目标")
-        # 说明文字改为鼠标悬停提示（见 __init__.py 里属性的 description）
-        box.prop(scene, "bridge_asset_name", text="资产名")
-        box.prop(scene, "bridge_note", text="备注")
 
-        row = box.row()
-        row.prop(prefs, "use_prefix", text="前缀")
-        row.prop(prefs, "send_mode", text="")
+        if prefs.target_app in ("photoshop", "sai2"):
+            # PS / SAI2 只能收发贴图：模型发送没有意义，只留贴图入口
+            label = "Photoshop" if prefs.target_app == "photoshop" else "SAI2"
+            box.label(text=f"只能发送贴图；在 {label} 里保存后自动重载", icon="INFO")
+            box.operator("bridge.send_textures",
+                         text=f"发送贴图到 {label}", icon="IMAGE_DATA")
+        else:
+            if prefs.target_app == "toolbag":
+                row = box.row()
+                row.prop(prefs, "toolbag_mode", text="模式", expand=True)
+                if prefs.toolbag_mode == "bake":
+                    box.label(text="烘焙：建烘焙组并烘焙，贴图回传 SP", icon="INFO")
+                else:
+                    box.label(text="渲染：只导入模型/材质", icon="INFO")
+            # 说明文字改为鼠标悬停提示（见 __init__.py 里属性的 description）
+            box.prop(scene, "bridge_asset_name", text="资产名")
+            box.prop(scene, "bridge_note", text="备注")
 
-        box.operator("bridge.send_selection", text="发送选中对象", icon="EXPORT")
+            row = box.row()
+            row.prop(prefs, "use_prefix", text="前缀")
+            row.prop(prefs, "send_mode", text="")
 
-        box.prop(prefs, "import_materials", text="带材质槽")
-        box.prop(prefs, "import_textures", text="带贴图")
+            box.operator("bridge.send_selection", text="发送选中对象", icon="EXPORT")
+
+            box.prop(prefs, "import_materials", text="带材质槽")
+            box.prop(prefs, "import_textures", text="带贴图")
 
         # --- 接收 -------------------------------------------------------
         box = layout.box()

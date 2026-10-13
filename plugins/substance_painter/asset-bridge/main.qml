@@ -4,9 +4,12 @@
 //   C:/Users/<你>/Documents/Adobe/Adobe Substance 3D Painter/plugins/
 //   （老版本是 .../Documents/Allegorithmic/Substance Painter/plugins/）
 //
-// SP 在这条链路上承担两件事：
+// SP 在这条链路上承担三件事：
 //   1) 接收模型：别的软件把 FBX 发过来，SP 直接用它开项目
-//   2) 回传贴图：把画好的 baseColor/normal/ORM 等发回 UE / Blender
+//   2) 接收贴图：Toolbag 把烘焙结果（kind=textures）发过来，
+//      导入当前工程的资源库并选中（必须先打开一个项目）
+//   3) 回传贴图：把画好的 baseColor/normal/ORM 等发回 UE / Blender /
+//      Maya，或发给 Photoshop / SAI2 用外部编辑器精修
 //
 // ---------------------------------------------------------------------------
 // API 全部按本机 Substance 3D Painter 自带文档核对过
@@ -122,7 +125,7 @@ PainterPlugin {
         var r = http("POST", "/sessions", {
             app: appName,
             project: projectName,
-            capabilities: { formats: ["fbx", "obj"], send: true, receive: true }
+            capabilities: { formats: ["fbx", "obj", "png", "tga"], send: true, receive: true }
         });
         if (r && r.session) {
             sessionId = r.session.session_id;
@@ -251,6 +254,12 @@ PainterPlugin {
             return;
         }
 
+        // Toolbag 烘焙结果回传（kind=textures）：导入当前工程资源库
+        if (rec.kind === "textures") {
+            handleTexturesIncoming(rec);
+            return;
+        }
+
         var files = rec._files_abs || [];
         if (!files.length) throw new Error("没有附件");
 
@@ -285,6 +294,90 @@ PainterPlugin {
 
         http("POST", "/transfers/" + rec.id + "/finish",
              { status: "done", result: { message: "SP 已接收" } });
+    }
+
+    // ---- 接收贴图（kind=textures，目前来自 Toolbag 烘焙结果）-----------
+    // 把贴图文件导入当前工程的资源库（shelf），并在资源视图里选中，
+    // 方便直接拖进图层栈。SP 必须已经打开一个工程——
+    // importProjectResource 在无工程时直接抛 ResourcesError。
+    function handleTexturesIncoming(rec) {
+        var files = rec._files_abs || [];
+        var images = [];
+        for (var i = 0; i < files.length; ++i) {
+            if (/\.(png|jpg|jpeg|tga|tif|tiff|bmp|exr)$/i.test(files[i])) {
+                images.push(files[i]);
+            }
+        }
+        if (!images.length) {
+            http("POST", "/transfers/" + rec.id + "/finish",
+                 { status: "error", result: { message: "没有可导入的贴图文件" } });
+            return;
+        }
+
+        // 没有打开的项目：importProjectResource 必然失败，直接报错回执
+        if (!alg.project.isOpen()) {
+            alg.log.warn("[bridge] SP 没有打开的项目，无法接收贴图");
+            http("POST", "/transfers/" + rec.id + "/finish",
+                 { status: "error",
+                   result: { message: "请先在 SP 打开一个项目再接收贴图" } });
+            return;
+        }
+
+        // 正忙（烘焙/重算）时不动资源库，直接报错让它稍后重试
+        if (alg.project.isBusy()) {
+            alg.log.warn("[bridge] SP 正忙（烘焙/计算中），本次接收贴图推迟");
+            http("POST", "/transfers/" + rec.id + "/finish",
+                 { status: "error", result: { message: "SP 正忙，请稍后重试" } });
+            return;
+        }
+
+        var urls = [];
+        var errors = [];
+        for (var j = 0; j < images.length; ++j) {
+            var p = images[j];
+            try {
+                // usage 必须与文件兼容：先查 allowedUsages，
+                // 优先用 "texture"（普通贴图），不在列表里才取第一个
+                var usages = alg.resources.allowedUsages(p);
+                var usage = "texture";
+                if (!usages || usages.indexOf(usage) < 0) {
+                    usage = (usages && usages.length) ? usages[0] : "texture";
+                }
+                var url = alg.resources.importProjectResource(p, [usage]);
+                urls.push(url);
+                alg.log.info("[bridge] 已导入贴图资源: " + p + " (" + usage + ")");
+            } catch (e) {
+                errors.push(p + ": " + e);
+                alg.log.warn("[bridge] 导入贴图失败 " + p + ": " + e);
+            }
+        }
+
+        if (!urls.length) {
+            http("POST", "/transfers/" + rec.id + "/finish", {
+                status: "error",
+                result: { message: "贴图全部导入失败", detail: errors }
+            });
+            return;
+        }
+
+        // 在 shelf 视图里选中刚导入的资源（失败不影响整体结果）
+        try {
+            alg.resources.selectResources(urls);
+        } catch (e2) {
+            alg.log.warn("[bridge] 选中导入的资源失败（不影响导入）: " + e2);
+        }
+
+        http("POST", "/transfers/" + rec.id + "/finish", {
+            status: "done",
+            result: {
+                message: "SP 已导入 " + urls.length + " 张贴图",
+                imported: urls,
+                failed: errors
+            }
+        });
+        alg.log.info("[bridge] 已接收 " + rec.asset_name + " 的 "
+                     + urls.length + " 张贴图（来自 "
+                     + ((rec.from || {}).app || "?") + "）");
     }
 
     // ---- 回传贴图：公共实现 -------------------------------------------

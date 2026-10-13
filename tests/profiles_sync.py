@@ -27,9 +27,13 @@ ROOT = Path(__file__).resolve().parent.parent
 SHARED = ROOT / "shared" / "profiles.json"
 
 COPIES = {
-    "blender": ROOT / "blender" / "addon" / "asset_bridge_blender" / "profiles.json",
-    "unreal": ROOT / "unreal" / "plugin" / "asset_bridge_unreal" / "profiles.json",
-    "maya": ROOT / "maya" / "plugin" / "asset_bridge_maya" / "profiles.json",
+    "blender": ROOT / "plugins" / "blender" / "asset_bridge_blender" / "profiles.json",
+    "unreal": ROOT / "plugins" / "unreal" / "AssetBridge" / "Content" / "Python"
+    / "asset_bridge_unreal" / "profiles.json",
+    "unreal_samples": ROOT / "samples" / "AssetBridgeTest" / "Content" / "Python"
+    / "asset_bridge_unreal" / "profiles.json",
+    "maya": ROOT / "plugins" / "maya" / "asset_bridge_maya" / "profiles.json",
+    "toolbag": ROOT / "plugins" / "toolbag" / "asset_bridge" / "profiles.json",
 }
 
 # 需要做一致性比对的路径（点分）
@@ -41,6 +45,10 @@ CHECK_PATHS = [
     "apps.maya.up_axis",
     "apps.maya.unit",
     "apps.substance_painter.up_axis",
+    "apps.toolbag.up_axis",
+    "apps.toolbag.unit",
+    "apps.photoshop.formats",
+    "apps.sai2.formats",
     "routes.blender>unreal.format",
     "routes.blender>unreal.export.global_scale",
     "routes.blender>unreal.import.convert_scene_unit",
@@ -50,6 +58,14 @@ CHECK_PATHS = [
     "routes.blender>maya.export.global_scale",
     "routes.blender>maya.import.scale_factor",
     "routes.blender>substance_painter.export.global_scale",
+    "routes.blender>toolbag.export.global_scale",
+    "routes.blender>toolbag.options.mode",
+    "routes.maya>toolbag.export.scale_factor",
+    "routes.unreal>toolbag.options.mode",
+    "routes.toolbag>substance_painter.kind",
+    "routes.blender>photoshop.kind",
+    "routes.blender>sai2.kind",
+    "routes.sai2>blender.kind",
     "naming.static_mesh",
     "naming.skeletal_mesh",
 ]

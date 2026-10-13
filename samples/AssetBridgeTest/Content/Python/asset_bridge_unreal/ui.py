@@ -23,6 +23,14 @@ _CMD_STOP = "import asset_bridge_unreal; asset_bridge_unreal.stop()"
 _CMD_SEND_BLENDER = "import asset_bridge_unreal; asset_bridge_unreal.send_selected_assets('blender')"
 _CMD_SEND_MAYA = "import asset_bridge_unreal; asset_bridge_unreal.send_selected_assets('maya')"
 _CMD_SEND_SP = "import asset_bridge_unreal; asset_bridge_unreal.send_selected_assets('substance_painter')"
+_CMD_SEND_TOOLBAG_BAKE = ("import asset_bridge_unreal; "
+                          "asset_bridge_unreal.send_selected_assets('toolbag', mode='bake')")
+_CMD_SEND_TOOLBAG_RENDER = ("import asset_bridge_unreal; "
+                            "asset_bridge_unreal.send_selected_assets('toolbag', mode='render')")
+_CMD_SEND_TEX_PS = ("import asset_bridge_unreal; "
+                    "asset_bridge_unreal.send_selected_textures('photoshop')")
+_CMD_SEND_TEX_SAI = ("import asset_bridge_unreal; "
+                     "asset_bridge_unreal.send_selected_textures('sai2')")
 
 # 工具栏菜单候选名。
 # 重要：现代 UE（5.x 后期）主工具栏是"拼"出来的，屏幕上每个按钮段都是一个独立子菜单
@@ -105,7 +113,8 @@ def _py_entry(name, label, command, tooltip=""):
 
 
 def _populate_actions(menu, prefix):
-    """往一个菜单里填 启动/停止/发送×3 + 实时状态（工具栏下拉/菜单栏/右键菜单共用）。"""
+    """往一个菜单里填 启动/停止/发送×N + 贴图子菜单 + 实时状态
+    （工具栏下拉/菜单栏/右键菜单共用）。"""
     menu.add_menu_entry("Bridge", _py_entry(prefix + "_Start", "启动桥接", _CMD_START))
     menu.add_menu_entry("Bridge", _py_entry(prefix + "_Stop", "停止桥接", _CMD_STOP))
     menu.add_menu_entry("Send", _py_entry(
@@ -117,6 +126,22 @@ def _populate_actions(menu, prefix):
     menu.add_menu_entry("Send", _py_entry(
         prefix + "_SP", "发送选中 -> Substance Painter", _CMD_SEND_SP,
         "把内容浏览器里选中的资产导出并推送到 Substance Painter"))
+    menu.add_menu_entry("Send", _py_entry(
+        prefix + "_ToolbagBake", "发送选中 -> Toolbag（烘焙）", _CMD_SEND_TOOLBAG_BAKE,
+        "导入高低模、建烘焙组并烘焙，烘焙贴图回传 Substance Painter"))
+    menu.add_menu_entry("Send", _py_entry(
+        prefix + "_ToolbagRender", "发送选中 -> Toolbag（渲染）", _CMD_SEND_TOOLBAG_RENDER,
+        "只把模型/材质导入 Toolbag，用于渲染"))
+    # 贴图子菜单：只发 Texture2D，保存后自动覆盖原资产
+    tex_sub = menu.add_sub_menu(menu.get_name(), "AssetBridge",
+                                prefix + "TexSub", "发送贴图到编辑器")
+    if tex_sub is not None:
+        tex_sub.add_menu_entry("Send", _py_entry(
+            prefix + "_TexPS", "Photoshop", _CMD_SEND_TEX_PS,
+            "把选中的 Texture2D 导出 PNG 发到 PS；保存后 UE 自动重载"))
+        tex_sub.add_menu_entry("Send", _py_entry(
+            prefix + "_TexSAI", "SAI2", _CMD_SEND_TEX_SAI,
+            "把选中的 Texture2D 导出 PNG 发到 SAI2；保存后 UE 自动重载"))
     menu.add_dynamic_section("Status", _StatusSection())
 
 
@@ -277,6 +302,12 @@ def _register_content_browser(menus):
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_Blender", "Blender", _CMD_SEND_BLENDER))
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_Maya", "Maya", _CMD_SEND_MAYA))
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_SP", "Substance Painter", _CMD_SEND_SP))
+    send_sub.add_menu_entry("Send", _py_entry("AB_CB_ToolbagBake", "Toolbag（烘焙）", _CMD_SEND_TOOLBAG_BAKE))
+    send_sub.add_menu_entry("Send", _py_entry("AB_CB_ToolbagRender", "Toolbag（渲染）", _CMD_SEND_TOOLBAG_RENDER))
+    tex_sub = cb.add_sub_menu(cb.get_name(), "AssetBridge", "ABTexSub", "发送贴图到编辑器")
+    if tex_sub is not None:
+        tex_sub.add_menu_entry("Send", _py_entry("AB_CB_TexPS", "Photoshop", _CMD_SEND_TEX_PS))
+        tex_sub.add_menu_entry("Send", _py_entry("AB_CB_TexSAI", "SAI2", _CMD_SEND_TEX_SAI))
     cb.add_menu_entry("AssetBridge", _py_entry("AB_CB_Start", "启动桥接", _CMD_START))
     cb.add_menu_entry("AssetBridge", _py_entry("AB_CB_Stop", "停止桥接", _CMD_STOP))
     cb.add_dynamic_section("Status", _StatusSection())

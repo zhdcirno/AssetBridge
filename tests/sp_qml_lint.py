@@ -21,8 +21,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-QML = os.path.join(ROOT, "substance_painter", "plugin", "asset-bridge", "main.qml")
-NODE = r"C:\Users\12069\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"
+QML = os.path.join(ROOT, "plugins", "substance_painter", "asset-bridge", "main.qml")
+NODE = r"C:\Users\12069\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
 
 
 def extract_functions(src):
@@ -64,7 +64,8 @@ def main():
     with open(js_path, "w", encoding="utf-8") as fh:
         # alg / XMLHttpRequest / JSON 都是 SP 注入的宿主对象，这里只要语法正确
         fh.write("var alg = {log: {info: function(){}, warn: function(){}, error: function(){}},\n"
-                 "  ui: {}, project: {}, texturesets: {}, mapexport: {}, baking: {}, fileIO: {}};\n")
+                 "  ui: {}, project: {}, texturesets: {}, mapexport: {}, baking: {},\n"
+                 "  fileIO: {}, resources: {}};\n")
         fh.write("var XMLHttpRequest = function(){};\n")
         for _, body in funcs:
             fh.write(body + "\n")
@@ -88,6 +89,8 @@ def main():
             ("没有用模板字符串", "`" not in src),
             ("用了 reloadMesh 吗（该 API 不存在）", "reloadMesh" not in src.split("//")[0]),
             ("textures_request 分支存在", "textures_request" in src),
+            ("textures 接收分支存在", "handleTexturesIncoming" in src),
+            ("导入贴图前查了 allowedUsages", "alg.resources.allowedUsages(" in src),
             ("导出结果过滤了空字符串", "if (maps[ch])" in src),
             ("烘焙调用的是 alg.baking.bake", "alg.baking.bake(" in src),
         ]

@@ -323,6 +323,71 @@ def import_textures(record: dict, file_paths: List[str]) -> List[str]:
     return imported
 
 
+def _import_one_texture(fp: str, dest_path: str, dest_name: str) -> List[str]:
+    """把单个图片文件导入为 Texture 资产（覆盖已存在的同名资产）。
+
+    dest_path 是包路径（如 /Game/Bridge/Textures），dest_name 是资产名。
+    压缩设置 / sRGB 按文件名通道推断（法线等数据图必须关 sRGB）。
+    """
+    display, comp_name, srgb = _channel_info(fp)
+    ensure_folder(dest_path)
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", fp)
+    task.set_editor_property("destination_path", dest_path)
+    task.set_editor_property("destination_name", dest_name)
+    task.set_editor_property("replace_existing", True)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("save", True)
+
+    factory = unreal.TextureFactory()
+    comp = _compression_enum(comp_name)
+    if comp is not None:
+        _safe_set(factory, "compression_settings", comp)
+    _safe_set(factory, "no_alpha", display == "BaseColor")
+    _safe_set(task, "factory", factory)
+
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    paths = list(task.get_editor_property("imported_object_paths") or [])
+    for p in paths:
+        _apply_texture_settings(p, comp_name, srgb)
+    return paths
+
+
+def reload_textures(record: dict, file_paths: List[str], opts: dict) -> List[str]:
+    """PS / SAI2 保存回传：把保存后的图片覆盖回原 Texture2D 资产。
+
+    发送端在 options.asset_paths / source_files 里记了「文件 -> 资产」对应关系
+    （守护进程原样带回），这里按文件名映射，用原资产的包路径 + replace_existing
+    原地覆盖 —— 材质引用不丢，不用重新连。
+    找不到对应资产时退化成按 content_path 新建（与 import_textures 同名规则）。
+    """
+    asset_paths = list(opts.get("asset_paths") or [])
+    source_files = list(opts.get("source_files") or [])
+    default_dir = _normalize_content_path(
+        (record.get("to") or {}).get("content_path", "/Game/Bridge/Textures")
+    )
+    imported = []
+    for fp in file_paths:
+        name = Path(fp).name
+        target = ""
+        if name in source_files:
+            idx = source_files.index(name)
+            if 0 <= idx < len(asset_paths):
+                target = asset_paths[idx]
+        if target:
+            dest_path = str(Path(target).parent)
+            dest_name = Path(target).name
+        else:
+            dest_path = default_dir
+            dest_name = "T_{0}_{1}".format(record.get("asset_name", "Tex"),
+                                           _channel_info(fp)[0])
+        try:
+            imported += _import_one_texture(fp, dest_path, dest_name)
+        except Exception as exc:
+            unreal.log_warning(f"[bridge] 重载贴图失败 {fp}: {exc}")
+    return imported
+
+
 def _spawn_static_mesh(subsystem, asset: unreal.StaticMesh,
                        location: unreal.Vector):
     """把一个 StaticMesh 摆进当前关卡，返回生成的 actor，失败返回 None。

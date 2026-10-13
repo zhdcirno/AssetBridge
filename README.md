@@ -1,6 +1,8 @@
 # Asset Bridge
 
-Blender / Unreal Engine / Maya / Substance Painter 之间的模型快速收发通道。  
+Blender / Unreal Engine / Maya / Substance Painter 之间的模型快速收发通道，  
+并额外支持 **Marmoset Toolbag 5**（烘焙 / 渲染）与 **Photoshop / SAI2**（贴图编辑：  
+其它软件把贴图发过去、**保存后自动回传**）。  
 工作区即本仓库根目录，所有代码、测试、日志、备份都在这里。  
 仓库：https://github.com/zhdcirno/AssetBridge
 
@@ -11,7 +13,9 @@ Blender / Unreal Engine / Maya / Substance Painter 之间的模型快速收发�
 Blender ─┐
 UE5     ─┼── HTTP/JSON ──> bridge_server ──> runtime/payloads/<transfer_id>/
 Maya    ─┤                      │
-SP      ─┘                      └── inbox 路由 / revision 计数 / 认领去重
+SP      ─┤                      ├── inbox 路由 / revision 计数 / 认领去重
+Toolbag ─┤                      │
+PS/SAI2 ─┘（由「编辑器守护进程」调用本程序打开，保存后回传，不经适配器轮询）
 ```
 
 ## 目录
@@ -20,17 +24,21 @@ SP      ─┘                      └── inbox 路由 / revision 计数 / �
 AssetBridge/
 ├── server/                 中转服务（stdlib only）
 ├── shared/profiles.json    换算档案【唯一事实源】改这里，再 --sync
-├── plugins/                四个 DCC 适配器（源 = 事实源）
+├── plugins/                七个 DCC / 编辑器适配器（源 = 事实源）
 │   ├── blender/asset_bridge_blender/        Blender 插件
 │   ├── maya/asset_bridge_maya/              Maya 插件（+ userSetup.py.example）
 │   ├── substance_painter/asset-bridge/      Substance Painter 插件 (QML)
-│   └── unreal/AssetBridge/                  UE 引擎级插件（.uplugin + Content/Python）
+│   ├── unreal/AssetBridge/                  UE 引擎级插件（.uplugin + Content/Python）
+│   └── toolbag/asset_bridge/                Toolbag 5 插件（mset API，data/plugin 自动加载）
 ├── tray/                   托盘守护 + 插件安装器（assetbridge_tray.ps1）
 │   └── tray_config.json    托盘配置：端口 / 自检间隔 / 中转路径 / 手动指定路径
+├── tools/
+│   ├── editor_daemon.py     编辑器守护进程（PS / SAI2：打开贴图 → 监听保存 → 自动回传）
+│   └── editor_daemon.json   守护配置：server_url + 各编辑器 exe 路径
 ├── runtime/payloads/       中转文件区（各软件互传的模型/贴图）
+├── runtime/editor_daemon/  守护进程的状态文件（daemon.pid / status.json / stop.flag）
 ├── backups/                安装/卸载前的自动备份（install_*/uninstall_*）
 ├── assets/icons/           图标源（由 tools/gen_icons.py 生成）
-├── tools/                  代码生成 / 诊断脚本
 ├── samples/AssetBridgeTest/ UE 测试工程（轻量样本）
 ├── tests/                  测试与自检脚本
 └── install.py              一键安装器（CLI）
@@ -42,13 +50,15 @@ AssetBridge/
 
 1. 双击 `tray/AssetBridge-Tray.vbs` 启动托盘（自动拉起中转服务）。
 2. 右键托盘图标 → **安装插件...**，安装器会：
-   - 自动探测本机 Blender / Maya / Substance Painter / Unreal 的安装路径与版本
+   - 自动探测本机 Blender / Maya / Substance Painter / Unreal / Toolbag 5 / Photoshop / SAI2 的安装路径
      （PATH / 环境变量 / App Paths 注册表 / 卸载注册表 / Autodesk 注册表 / 文件关联 / 快捷方式 / 各盘 DCC 目录扫描）；
    - 按最低版本要求校验，过低会提示无法安装：
      - **Blender ≥ 5.0**
      - **Maya ≥ 2023**
      - **Substance Painter ≥ 10.0.1（build 3757）**
      - **Unreal Engine ≥ 5.8**
+     - **Marmoset Toolbag ≥ 5.0**（烘焙 / 渲染两用）
+     - **Photoshop / SAI2：不限版本**（不装插件，仅由「编辑器守护进程」调用打开，路径同步进 `tools/editor_daemon.json`）
    - 一键把对应插件装到正确位置；UE 装成**引擎级插件** `<UE>/Engine/Plugins/AssetBridge`，对所有该版本工程通用，无需改工程配置；
    - 已装过的软件显示「已安装（最新）/ 已安装（源已更新，可重装）」，安装按钮变成**更新**；
    - **卸载**会先把插件移到 `backups/uninstall_<时间戳>/`，可回滚，绝不直接删；
@@ -69,6 +79,21 @@ AssetBridge/
 托盘常驻会自动守护中转服务（`127.0.0.1:27631`）。也可手动运行：  
 `python server/server.py --root runtime` 或 `server/start_bridge_server.bat`。  
 互传的模型/贴图落在 `runtime/payloads/<transfer_id>/`，可在托盘设置里查看路径、打开文件夹或一键清空。
+
+## 支持的流转
+
+| 源 → 目标            | 内容            | 说明                                                                 |
+| ------------------- | --------------- | -------------------------------------------------------------------- |
+| 任意 → Blender/UE/Maya/SP | 模型（网格/骨骼/材质槽/UV） | 适配器常驻轮询 inbox，收到自动导入，支持增量更新 |
+| SP → UE / Blender   | 贴图（baseColor/normal/ORM…） | SP 回传 `kind=textures`，发送端对应资产原地重载（引用不丢） |
+| 任意 → **Toolbag 5** | 模型            | 发送时选 **烘焙模式**（建烘焙组+设高低模）或 **渲染模式**（仅导入模型/材质） |
+| Toolbag → SP        | 烘焙贴图        | 八猴只把烘焙结果发 SP（暂不支持发其它软件）；SP 用 `importProjectResource` 收下 |
+| 任意 → **Photoshop / SAI2** | 贴图（仅贴图） | 由**编辑器守护进程**调用 exe 打开文件；保存后自动回传给发送端并重载 **（无需 ps2other）** |
+| Photoshop / SAI2 → 其它 | — | 不支持（编辑器是纯接收端，保存即回传） |
+
+> **编辑器守护进程**（`tools/editor_daemon.py`，由托盘「启动编辑器守护」拉起）：  
+> PS / SAI2 没有可编程 API，所以由一个独立进程负责「打开贴图文件 → 监听文件 mtime/大小（含另存为新文件）→ 稳定后自动回传 → 触发发送端重载」。  
+> 托盘右键菜单里可以启动 / 停止 / 查看守护状态，停止只发 `stop.flag`，**绝不杀用户的 PS / SAI2**。
 
 ## 实机验证结果（2026-09-24，本机真实跑出来的）
 
@@ -100,6 +125,18 @@ AssetBridge/
 | 清空中转文件夹（统计项数 + 释放空间，失败项进日志）                 | ✅ 通过 |
 | 事件异常三层兜底（逐个 try/catch + 全局 ThreadException）   | ✅ 通过 |
 
+### 新增流转（2026-10-13，无头用例 + 部署到本机真实路径）
+
+| 项目                                                | 结果  |
+| ------------------------------------------------- | --- |
+| Toolbag 适配器逻辑（烘焙回传 SP / 渲染仅导入 / 贴图拒绝 / 服务宕机退避 / 空转安全） | ✅ 5/5 |
+| 编辑器守护闭环（PS 原地保存回传 + options 合并 / SAI2 另存为新文件 / 缺 from.app 报错 / 未保存 cancelled / 服务不可达 / --stop 空闲） | ✅ 7/7 |
+| Blender 发贴图到编辑器 + 保存后重载（回传重载 / 普通载入 / 匹配规则 / from.project） | ✅ 7/7 |
+| Maya / UE 发贴图到编辑器 + 回传重载协议                 | ✅ 部署完成 |
+| SP 接收 `kind=textures`（importProjectResource + selectResources） | ✅ lint 通过 |
+| 托盘：Toolbag/PS/SAI2 探测 + 手动指定解析 + 守护菜单 + 配置同步 | ✅ 无头用例通过 |
+| install.py 增加 Toolbag 安装步骤 + 守护配置同步           | ✅ dry-run 通过 |
+
 ### 单位换算（实测定论，别改）
 
 **Blender 5.0 导出的 FBX 有效单位是厘米**：顶点按米写（1m 立方体半边长 0.5），  
@@ -114,7 +151,7 @@ AssetBridge/
 
 ```bash
 python tests/profiles_sync.py --sync     # 同步
-python tests/profiles_sync.py            # 一致性自检（18 个关键字段 × 4 份）
+python tests/profiles_sync.py            # 一致性自检（30 个关键字段 × 6 份）
 ```
 
 ## 快速开始
@@ -146,12 +183,17 @@ python server/server.py --root E:/CirnoWorkSpace/AssetBridge/runtime
 
 ```bash
 python tests/smoke_test.py                  # 协议层 16 项
-python tests/profiles_sync.py               # 换算档案一致性（4 份 × 18 字段）
+python tests/profiles_sync.py               # 换算档案一致性（6 份 × 30 字段）
 python tests/maya_stub_harness.py           # Maya 适配器逻辑（假 maya 模块 + 真服务）26 项
 python tests/maya_commandport_verify.py     # Maya 实机（需先在 Maya 里启动适配器）
 python tests/sp_qml_lint.py                 # SP 插件 JS 语法自检（重启 SP 前先跑）
 python tests/sp_send_model.py               # Blender 发模型给 SP（SP 会自动开项目）
 python tests/sp_to_ue_chain.py              # SP 烘焙 + 回传贴图 -> UE 收入（一条命令跑完）
+# 本轮新增流转的自检（无头，不需起 DCC）
+python tests/test_toolbag_adapter.py        # Toolbag 适配器 5 项（烘焙回传 SP / 渲染仅导入 / 拒绝贴图 / 退避 / 空转）
+python tests/test_editor_daemon.py          # 编辑器守护 7 项（PS/SAI2 保存回传 + options 合并 + cancelled / 服务不可达）
+python tests/test_blender_textures.py       # Blender 发贴图 + 保存后重载 7 项
+python tests/test_tray_functions.py         # 托盘安装器逻辑（探测 / 手动指定 / 守护菜单 / 配置同步）
 ```
 
 ## 注意事项

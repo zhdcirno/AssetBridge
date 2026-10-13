@@ -62,6 +62,60 @@
         "usd"
       ],
       "note": "SP 主要做「接收模型 / 回传贴图」，收发模型是次要路径"
+    },
+    "toolbag": {
+      "display": "Marmoset Toolbag",
+      "up_axis": "Y",
+      "forward_axis": "Z",
+      "unit": "m",
+      "unit_to_cm": 100.0,
+      "handedness": "right",
+      "script_lang": "python",
+      "formats": [
+        "fbx",
+        "obj",
+        "usd",
+        "abc"
+      ],
+      "note": "Toolbag 5 内嵌 Python（模块名 mset）。烘焙/渲染两种模式，见 routes.*>toolbag.options.mode"
+    },
+    "photoshop": {
+      "display": "Adobe Photoshop",
+      "up_axis": "-",
+      "forward_axis": "-",
+      "unit": "px",
+      "unit_to_cm": 1.0,
+      "handedness": "right",
+      "script_lang": "none",
+      "formats": [
+        "png",
+        "psd",
+        "tga",
+        "jpg",
+        "jpeg",
+        "bmp",
+        "exr",
+        "tif"
+      ],
+      "note": "无应用内适配器：由 tools/editor_daemon.py 外部守护进程代管（打开文件 + 监听保存回传）"
+    },
+    "sai2": {
+      "display": "SAI2",
+      "up_axis": "-",
+      "forward_axis": "-",
+      "unit": "px",
+      "unit_to_cm": 1.0,
+      "handedness": "right",
+      "script_lang": "none",
+      "formats": [
+        "png",
+        "psd",
+        "bmp",
+        "jpg",
+        "jpeg",
+        "tif"
+      ],
+      "note": "同 Photoshop：外部守护进程代管；SAI2 默认存 .sai2，回传需另存为 PNG/PSD"
     }
   },
   "routes": {
@@ -181,6 +235,136 @@
         "blender": "5.0.1",
         "maya": "2023"
       }
+    },
+    "blender>toolbag": {
+      "format": "fbx",
+      "export": {
+        "global_scale": 1.0,
+        "apply_unit_scale": true,
+        "use_space_transform": true,
+        "axis_forward": "-Z",
+        "axis_up": "Y"
+      },
+      "import": {
+        "scene_unit_scale": 1.0
+      },
+      "options": {
+        "mode": "bake"
+      },
+      "_why": "Toolbag 是 m 单位 / Y-up。Blender 5.0 导出的 FBX 有效单位已是 cm，Toolbag 导入时按 0.01 换算回 m，故 global_scale 保持 1.0。options.mode 由发送端 UI 选择：bake=烘焙（建烘焙组+高低模），render=仅导入。"
+    },
+    "maya>toolbag": {
+      "format": "fbx",
+      "export": {
+        "up_axis": "y",
+        "units": "cm",
+        "scale_factor": 1.0
+      },
+      "import": {
+        "scene_unit_scale": 1.0
+      },
+      "options": {
+        "mode": "bake"
+      },
+      "_why": "Maya cm / Y-up，与 Toolbag 只差单位制，FBX 内为 cm，Toolbag 侧按 0.01 换算。"
+    },
+    "unreal>toolbag": {
+      "format": "fbx",
+      "export": {
+        "ascii": false
+      },
+      "import": {
+        "scene_unit_scale": 1.0
+      },
+      "options": {
+        "mode": "bake"
+      },
+      "_why": "UE cm / Z-up，FBX 带 Convert Scene 处理换轴；单位同样走 Toolbag 侧 0.01 换算。"
+    },
+    "toolbag>substance_painter": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "Toolbag 只回传烘焙贴图（烘焙完成后自动发一条 kind=textures 给 SP）。SP 侧作为工程资源导入。"
+    },
+    "blender>photoshop": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "只发贴图。PS 由外部守护进程打开；保存后守护进程回传一条 kind=textures 给发送端（options.return_of 指向原 transfer），发送端自动重载。"
+    },
+    "maya>photoshop": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "unreal>photoshop": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "substance_painter>photoshop": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "blender>sai2": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "maya>sai2": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "unreal>sai2": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "substance_painter>sai2": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "同 blender>photoshop"
+    },
+    "photoshop>blender": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道（发送端自动重载）"
+    },
+    "photoshop>maya": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
+    },
+    "photoshop>unreal": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
+    },
+    "photoshop>substance_painter": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
+    },
+    "sai2>blender": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道（发送端自动重载）"
+    },
+    "sai2>maya": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
+    },
+    "sai2>unreal": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
+    },
+    "sai2>substance_painter": {
+      "format": "textures",
+      "kind": "textures",
+      "_note": "守护进程回传通道"
     }
   },
   "naming": {

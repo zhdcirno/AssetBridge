@@ -1,23 +1,22 @@
 # Asset Bridge 使用文档（面向美术 / 技术美术）
 
-> 适用版本：Blender 5.0.1、Unreal Engine 5.8.3、Maya 2023、Substance 3D Painter（本机实测）
-> 项目根目录：`E:\CirnoWorkSpace\AssetBridge`
+> 适用版本：Blender 5.0.1、Unreal Engine 5.8.3、Maya 2023、Substance 3D Painter、Marmoset Toolbag 5、Photoshop 2023、SAI2（本机实测）  
+> 项目根目录：`E:\CirnoWorkSpace\AssetBridge`  
 > 中转服务地址：`http://127.0.0.1:27631`　数据根：`E:\CirnoWorkSpace\AssetBridge\runtime`
 
 ---
 
 ## 1. 总览
 
-**Asset Bridge 是「一键互发 DCC 资产」的本地中转工具**：在任一软件里选中模型 / 贴图 / 骨架，点一下就能发到另一个软件，对方自动收下并导入。Blender、Unreal、Maya、Substance Painter 之间互相收发，支持**增量更新同名资产**、**单位换算**、**材质槽 / UV / 骨架一起过**。
+**Asset Bridge 是「一键互发 DCC 资产」的本地中转工具**：在任一软件里选中模型 / 贴图 / 骨架，点一下就能发到另一个软件，对方自动收下并导入。Blender、Unreal、Maya、Substance Painter 之间互相收发，并扩展支持 **Marmoset Toolbag 5**（烘焙 / 渲染）与 **Photoshop / SAI2**（贴图编辑：发过去、**保存后自动回传**）。支持**增量更新同名资产**、**单位换算**、**材质槽 / UV / 骨架一起过**。
 
 ### 架构示意
 
 ```
   Blender          Unreal Engine        Maya         Substance Painter
     │                │                  │                  │
-    │  选中对象      │                  │                  │
-    │  点「发送」    │  内容浏览器选中  │  send_selection   │  点「发贴图」
-    │      │         │  命令行发送       │      │           │      │
+    │  选中对象      │  内容浏览器选中   │  send_selection   │  点「发贴图」
+    │  点「发送」    │  命令行发送        │      │           │      │
     └──────┼─────────┼──────────────────┼──────────┼──────┘
            │  HTTP / JSON（仅本机 127.0.0.1:27631）
            ▼
@@ -34,27 +33,33 @@
    │  SM_Chair.fbx / T_*.png …                      │
    └───────────────────────────────────────────────┘
                            ▲
-                           │  四个软件各自后台轮询自己的收件箱，收到就自动导入
+                           │  Blender/UE/Maya/SP 各自后台轮询自己的收件箱，收到就自动导入
+                           │
+                 Toolbag 5（mset 插件轮询）  ·  PS / SAI2（由编辑器守护进程调用打开，保存后回传）
 ```
 
 ### 支持的能力
 
-| 能力 | 说明 |
-|---|---|
-| 模型收发 | 静态网格（SM_）/ 骨骼网格（SK_）在四软件间互发 |
-| 贴图回传 | Substance Painter 画好的 baseColor / normal / ORM 等发回 UE（kind=textures） |
-| 骨架收发 | FBX 自带骨骼层级，自动随模型过到 UE，不丢朝向 |
-| 增量更新 | 重复发送同名资产 = 覆盖更新（revision 递增），**不会**生成 `SM_Chair_1` |
-| 单位换算 | 米 / 厘米、Z-up / Y-up 自动处理，集中在 `shared/profiles.json` |
-| 材质槽 / UV | 材质槽、UV 集、顶点色随 FBX 一起走，UE 侧自动建材质 |
+| 能力       | 说明                                                                   |
+| -------- | -------------------------------------------------------------------- |
+| 模型收发     | 静态网格（SM\_）/ 骨骼网格（SK\_）在 Blender / UE / Maya / SP / **Toolbag** 间互发 |
+| 贴图回传     | Substance Painter 画好的 baseColor / normal / ORM 等发回 UE / Blender（kind=textures） |
+| 骨架收发     | FBX 自带骨骼层级，自动随模型过到 UE，不丢朝向                                           |
+| 增量更新     | 重复发送同名资产 = 覆盖更新（revision 递增），**不会**生成 `SM_Chair_1`                   |
+| 单位换算     | 米 / 厘米、Z-up / Y-up 自动处理，集中在 `shared/profiles.json`                   |
+| 材质槽 / UV | 材质槽、UV 集、顶点色随 FBX 一起走，UE 侧自动建材质                                      |
+| Toolbag 流转 | 其它软件发模型到八猴：选 **烘焙**（建烘焙组 + 设高低模）或 **渲染**（仅导入模型/材质）；八猴烘焙结果只回传 **SP** |
+| 编辑器流转   | 其它软件把**贴图**发到 **Photoshop / SAI2**，保存后**自动回传**并重载发送端资产（无 ps2other） |
 
-> ⚠️ **铁律：中转服务必须先启动，四个软件都连它。** 任一软件没反应，第一步永远是先确认服务在跑（见第 5 节排查）。
+> ⚠️ **铁律：中转服务必须先启动，各软件都连它。** PS / SAI2 还需托盘里**启动编辑器守护进程**才能自动回传（见第 4.6 节）。任一软件没反应，第一步永远是先确认服务在跑（见第 5 节排查）。
+
+
 
 ---
 
 ## 2. 安装与启动
 
-> 适配器文件**已经拷到各软件对应的目录里了**（见安装日志 `logs/install_20260924_040621.log`）。
+> 适配器文件**已经拷到各软件对应的目录里了**（见安装日志 `logs/install_20260924_040621.log`）。  
 > 你只需做下面每个软件标注的「需手动操作」步骤，把适配器**启用 / 加载**起来。
 
 ### 2.1 中转服务（最先做，必须）
@@ -71,16 +76,16 @@ C:\Users\12069\Desktop\AssetBridge-Tray.vbs
 
 右下角托盘会出现一个图标，**颜色 = 服务状态**：
 
-| 图标 | 含义 |
-|---|---|
-| 🟢 绿圆 + ▶ | 服务**运行中** |
-| 🟠 琥珀圆 + ❗ | 服务**掉线**，守护会在 10 秒内自动拉起 |
-| ⚪ 灰圆 + ⏸ | 服务运行中，但**守护已暂停**（不会自动拉起） |
-| 🔴 红圆 + ■ | 服务**已停止**（守护也暂停） |
+| 图标         | 含义                       |
+| ---------- | ------------------------ |
+| 🟢 绿圆 + ▶  | 服务**运行中**                |
+| 🟠 琥珀圆 + ❗ | 服务**掉线**，守护会在 10 秒内自动拉起  |
+| ⚪ 灰圆 + ⏸   | 服务运行中，但**守护已暂停**（不会自动拉起） |
+| 🔴 红圆 + ■  | 服务**已停止**（守护也暂停）         |
 
 > 图标全部由 `tools\gen_icons.py` 生成，清单与自定义方法见 `docs\ICONS.md`。
 
-- **双击图标** → 状态小窗（状态 / 端口 / PID / 守护开关 / 最近日志 + 启动·停止·重启·设置·隐藏到托盘）。
+- **双击图标** → 状态小窗（状态 / 端口 / PID / 守护开关 / 最近日志 + 启动·停止·重启·设置·隐藏到托盘）。  
   点右上角关闭 = **缩回托盘，不退出**。
 - **右键图标** → 菜单：
 
@@ -98,16 +103,16 @@ C:\Users\12069\Desktop\AssetBridge-Tray.vbs
 退出（服务保持运行）
 ```
 
-> 🛡️ **它自带看门狗**：每 N 秒（默认 10 秒）自检一次 `127.0.0.1:27631`，服务掉了自动拉起。
-> 所以**不需要**再开那个会常驻黑窗口的 `bridge_watchdog.ps1` / `run_watchdog.bat`（保留着只当"前台调试"用）。
+> 🛡️ **它自带看门狗**：每 N 秒（默认 10 秒）自检一次 `127.0.0.1:27631`，服务掉了自动拉起。  
+> 所以**不需要**再开那个会常驻黑窗口的 `bridge_watchdog.ps1` / `run_watchdog.bat`（保留着只当"前台调试"用）。  
 > 这样能避免「中转服务进程意外退出 → 各 DCC 软件卡死」这类单点故障（见第 5.8 节）。
 
-> ℹ️ 托盘由 `tray\assetbridge_tray_launch.vbs` 以「窗口样式 0」启动 → **全程没有任何控制台窗口**；
-> 服务本身由 `pythonw.exe` + `tray\run_server.py` 启动 → 也**没有窗口**，且与托盘进程解耦
-> （**退出托盘不会连带杀掉服务**，只有点「退出并停止服务」/「停止服务」才会停）。
+> ℹ️ 托盘由 `tray\assetbridge_tray_launch.vbs` 以「窗口样式 0」启动 → **全程没有任何控制台窗口**；  
+> 服务本身由 `pythonw.exe` + `tray\run_server.py` 启动 → 也**没有窗口**，且与托盘进程解耦  
+> （**退出托盘不会连带杀掉服务**，只有点「退出并停止服务」/「停止服务」才会停）。  
 > 日志：托盘 `logs\tray.log`，服务控制台输出 `logs\server_console.log`，配置 `tray\tray_config.json`。
 
-> ⚠️ **单实例保护**：托盘同一时间只能有一个。若双击后"没反应"，通常说明托盘已在运行（右下角找图标）。
+> ⚠️ **单实例保护**：托盘同一时间只能有一个。若双击后"没反应"，通常说明托盘已在运行（右下角找图标）。  
 > 想重启托盘：先右键图标 → 退出，再双击启动器。
 
 **备用方式 A：黑窗口常驻（无托盘时）**
@@ -124,10 +129,10 @@ E:\CirnoWorkSpace\AssetBridge\start_bridge_server.bat
 python E:\CirnoWorkSpace\AssetBridge\server\server.py --root E:/CirnoWorkSpace/AssetBridge/runtime
 ```
 
-> 🔴 **铁律（务必先读）**：**中转服务没起，四个 DCC 软件全部会变卡！**
-> 旧版适配器在服务不可达时会在主线程高频同步请求、且无退避/熔断，结果就是：
-> Blender 列表找不到插件、Maya 卡在启动界面、UE 打开关卡极慢、SP 疯狂刷
-> `HTTP 0` 日志。新版已全部改为「后台线程 + 指数退避 + 熔断 + 注册重试」，
+> 🔴 **铁律（务必先读）**：**中转服务没起，四个 DCC 软件全部会变卡！**  
+> 旧版适配器在服务不可达时会在主线程高频同步请求、且无退避/熔断，结果就是：  
+> Blender 列表找不到插件、Maya 卡在启动界面、UE 打开关卡极慢、SP 疯狂刷  
+> `HTTP 0` 日志。新版已全部改为「后台线程 + 指数退避 + 熔断 + 注册重试」，  
 > 但**服务仍必须先起**。任一软件没反应，第一步永远是先确认服务在跑。
 
 命令行等价写法（不用 bat 时）：
@@ -148,16 +153,17 @@ python E:\CirnoWorkSpace\AssetBridge\server\server.py --root E:/CirnoWorkSpace/A
 
 ### 2.2 Blender（需手动启用插件）
 
-> ⚠️ **重要路径更正**：Blender 5.0 的用户级插件目录是
-> `C:\Users\12069\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\asset_bridge_blender`
-> （即 `%APPDATA%\Blender Foundation\Blender\5.0\scripts\addons\`）。
-> 旧版文档写的 `D:\DCC\Blender5.0.1\5.0\scripts\addons\` **不在 5.0 的搜索路径里**，
-> 装在那里插件在列表里根本找不到。安装器已自动清理旧错误路径与误装的单个
+> ⚠️ **重要路径更正**：Blender 5.0 的用户级插件目录是  
+> `C:\Users\12069\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\asset_bridge_blender`  
+> （即 `%APPDATA%\Blender Foundation\Blender\5.0\scripts\addons\`）。  
+> 旧版文档写的 `D:\DCC\Blender5.0.1\5.0\scripts\addons\` **不在 5.0 的搜索路径里**，  
+> 装在那里插件在列表里根本找不到。安装器已自动清理旧错误路径与误装的单个  
 > `__init__.py`，并把整个包复制到上面的正确目录。
 
 适配器已就位：`C:\Users\12069\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\asset_bridge_blender`
 
 > ⚠️ **需手动操作**：Blender 的插件机制**无法绕过**，必须手动勾选启用一次。
+>
 > 1. 打开 Blender → `Edit` → `Preferences`（编辑 → 偏好设置）
 > 2. 左侧选 `Add-ons`（插件）
 > 3. 右上搜索框输入 **`Asset Bridge`**
@@ -183,9 +189,9 @@ python E:\CirnoWorkSpace\AssetBridge\server\server.py --root E:/CirnoWorkSpace/A
 
 重启后工具栏会出现桥接按钮（见第 3.4 节）。SP 启动日志在 SP 的 `Log` 面板里看 `[bridge]` 前缀。
 
-> 💡 **注册自重试**：新版 SP 适配器在 `start_bridge_server.bat` 启动后若服务还没起来，会按
-> 指数退避**自动重试注册**（连续失败 ≥5 次会熔断并提示「请先启动 start_bridge_server.bat」，
-> 之后每 30 秒探测恢复）。所以服务恢复后 SP 会自动重新上线，**无需手动重启 SP**。
+> 💡 **注册自重试**：新版 SP 适配器在 `start_bridge_server.bat` 启动后若服务还没起来，会按  
+> 指数退避**自动重试注册**（连续失败 ≥5 次会熔断并提示「请先启动 start_bridge_server.bat」，  
+> 之后每 30 秒探测恢复）。所以服务恢复后 SP 会自动重新上线，**无需手动重启 SP**。  
 > 但**改动 `main.qml` 源代码后仍需完全重启 SP** 才会生效（QML 无热重载）。
 
 ### 2.5 Unreal Engine（打开工程即自动加载）
@@ -195,9 +201,11 @@ python E:\CirnoWorkSpace\AssetBridge\server\server.py --root E:/CirnoWorkSpace/A
 - `DefaultEngine.ini` 已追加 `[/Script/PythonScriptPlugin.PythonScriptPluginSettings]` 段自动启用
 
 > ⚠️ **无需 GUI 勾选**：用这个工程文件打开即可自动加载：
+>
 > ```
 > E:\CirnoWorkSpace\AssetBridge\unreal\project\AssetBridgeTest\AssetBridgeTest.uproject
 > ```
+>
 > 打开 / 重启 `AssetBridgeTest` 工程，适配器自动 `start()`（前提是中转服务已起，否则会打一条 `[bridge] 连接中转服务失败` 警告，但工程照常能开，服务起来后下一轮自动连上）。
 
 UE 侧发送是**命令行触发**（没有 GUI 按钮），见第 3.3 节。
@@ -211,6 +219,7 @@ UE 侧发送是**命令行触发**（没有 GUI 按钮），见第 3.3 节。
 4) 重启 Substance Painter
 5) 打开 AssetBridgeTest.uproject
 ```
+
 四个软件都连同一个 `127.0.0.1:27631`，谁先开后开都行，**只要服务先起**。
 
 ---
@@ -222,6 +231,7 @@ UE 侧发送是**命令行触发**（没有 GUI 按钮），见第 3.3 节。
 **入口**：3D 视图 → 按 `N` 打开右侧边栏 → **Asset Bridge** 标签页（面板内分「发送 / 接收 / 中转服务」三块）。
 
 **发送**：
+
 1. 在 3D 视图里**选中**要发的网格 / 骨架（多选可发多个）。
 2. 在「发送」块里：
    - **目标**：下拉选 `Unreal Engine` / `Maya` / `Substance Painter` / `Blender`
@@ -232,6 +242,7 @@ UE 侧发送是**命令行触发**（没有 GUI 按钮），见第 3.3 节。
 4. 成功会在底部状态栏提示：`已发送 SM_Chair -> unreal（第 1 版，SM_Chair.fbx）`。
 
 **接收**：
+
 - 默认**自动接收**已勾选（`自动接收` 开关）——别的软件发过来，Blender 后台每 0.5 秒轮询一次，收到就自动导入，并弹一个 `Asset Bridge 已导入 N 项资产` 提示。
 - 想手动拉一次：点 **「立即接收」** 按钮。
 - 想看底层文件：点接收块右侧的**文件夹图标**（打开负载目录）。
@@ -258,7 +269,7 @@ abm.send_selection(target_app="unreal")
 abm.send_selection(target_app="unreal", note="从 Maya 发的椅子")
 ```
 
-> 目标软件就是命令里的 `target_app="..."` 参数（取值：`unreal` / `maya` / `substance_painter` / `blender`）。
+> 目标软件就是命令里的 `target_app="..."` 参数（取值：`unreal` / `maya` / `substance_painter` / `blender`）。  
 > 发送成功会在 Script Editor 提示：`[bridge] 已发送 Chair -> unreal (rev 1)`。
 
 **接收**：**全自动**。适配器挂了 `idle` 脚本任务（scriptJob），Maya 空闲时自动轮询「发给 Maya」的收件箱并导入到当前场景，无需任何操作。提示形如 `[bridge] 收到 SM_Chair (rev 1)`。
@@ -287,7 +298,7 @@ abu.send_selected_assets("blender")
 # 想发到 Maya：abu.send_selected_assets("maya")
 ```
 
-> 目标软件 = `send_selected_assets("blender" | "maya" | "substance_painter")` 的第一个参数。
+> 目标软件 = `send_selected_assets("blender" | "maya" | "substance_painter")` 的第一个参数。  
 > 发送成功 Output Log 提示：`[bridge] 已发送 1 个资产 -> blender (rev 1)`。
 
 **确认导入结果**：在内容浏览器里看 `/Game/Bridge` 下是否出现了同名资产（覆盖更新不会加 `_1`）。
@@ -295,22 +306,48 @@ abu.send_selected_assets("blender")
 ### 3.4 Substance Painter（发送 / 接收）
 
 **入口**：SP 工具栏上的桥接按钮（由 `toolbar.qml` 注入），一组两个按钮：
+
 - **收模型**（pull）—— 从收件箱拉取别的软件发来的模型
 - **发贴图**（push）—— 把当前项目画好的贴图回传给目标软件
 
 **接收模型**：
+
 - 方式 A（自动）：SP 默认每 1 秒轮询收件箱，收到模型会用它**直接开一个新项目**（SP 没有「原地刷新网格」的 API，所以会先自动保存当前项目，再关掉、用新网格新建）。
 - 方式 B（手动）：点工具栏 **「收模型」** 按钮。
 - 成功后 SP 日志：`[bridge] 已打开 SM_Cube（第 1 版）`。
 
 **回传贴图**：
+
 - 点工具栏 **「发贴图」** 按钮。
 - 默认发回：`Unreal` / 工程 `AssetBridgeTest` / 路径 `/Game/Bridge/Textures`（这些默认值写在 `main.qml` 里）。
 - 导出用当前工程自带的导出预设（没有则兜底 `PBR MetalRough`），按激活贴图集分辨率导出。
 - 成功后 UE 侧会自动收下贴图并建成 `Texture2D`（baseColor=颜色、normal/ORM/Rough 等按通道自动设压缩与 sRGB）。
 
-> 回传前请确保在 SP 里**已经烘焙 / 绘制**了贴图，否则会提示「没有导出任何贴图」。
+> 回传前请确保在 SP 里**已经烘焙 / 绘制**了贴图，否则会提示「没有导出任何贴图」。  
 > ⚠️ 想让 SP 的贴图被**远程一键拉回**（而不是人去点按钮），由 UE / Blender 侧脚本发一条 `kind=textures_request` 给 SP 即可，SP 收到会自动烘焙 + 导出 + 回传。
+
+### 3.5 Marmoset Toolbag 5（烘焙 / 渲染）
+
+八猴**没有独立按钮**，它作为「被发送端」：在 Blender / UE / Maya / SP 里把模型发往 **Toolbag**，发送时选择模式：
+
+- **烘焙模式（默认）**：八猴收到后 `addGroup` 建烘焙组，用 `importModel` 让快速加载器自动归类高/低模，执行 `bake()`；烘焙完成（输出目录出现新文件且 mtime 稳定即判定完成）后，把烘焙贴图作为 `kind=textures` **回传给 SP**（目前只支持发 SP，不发其它软件）。SP 侧用 `importProjectResource` 收下并选中。
+- **渲染模式**：只 `importModel / importMaterial / frameObject` 导入模型与材质，不烘焙，供你直接在八猴里渲染出图。
+
+> 八猴插件通过 `mset.callbacks.onPeriodicUpdate` 轮询收件箱，无需手动操作。首次使用若没反应，确认插件在 `data/plugin/asset_bridge` 且八猴已重启加载。
+
+### 3.6 Photoshop / SAI2（贴图编辑，保存后自动回传）
+
+这两个软件**没有可编程 API**，所以走「**编辑器守护进程**」方案，且是**纯接收端**（没有 ps2other / sai2→other）：
+
+1. **前置**：托盘右键 → **启动编辑器守护**（默认随托盘常驻常已运行）。守护进程读 `tools/editor_daemon.json` 里的 exe 路径。
+2. 在 Blender / Maya / UE 里，选中含有贴图的资产，点 **「发送贴图到 Photoshop」/「发送贴图到 SAI2」**（仅贴图可发，模型不行）。
+3. 守护进程认领后，直接用 `exe 文件路径` 打开该贴图；你的 PS / SAI2 窗口就加载了该文件。
+4. **你在 PS / SAI2 里正常编辑并保存**（原地保存或另存为新文件都行）。守护进程监听到文件 mtime/大小稳定（或同目录出现新图片）后，自动建一条 `kind=textures` 回传记录，并把原始 transfer 的 `options`（如 `return_of` / `source_file`）合并回去。
+5. 发送端收到后**在原资产上原地重载贴图**（引用不丢，不会新建重复资产）。
+6. 若你**没保存直接关闭**编辑器，守护进程宽限一段时间后按 `cancelled` 收尾，不回传。
+
+> 停止守护只写 `stop.flag` 让它干净退出，**绝不杀你的 PS / SAI2 进程**。  
+> 想看守护状态：托盘右键菜单里有「编辑器守护：运行中 / 未运行」一行，以及「启动/停止编辑器守护」两项。
 
 ---
 
@@ -320,12 +357,13 @@ abu.send_selected_assets("blender")
 
 本机实测（2026-09-24，Blender 5.0.1 + UE 5.8.3）：
 
-| 场景 | 实测结果 |
-|---|---|
-| Blender 1m 立方体 → UE | **100 × 100 × 100 cm** ✅（正确，米→厘米由 UE 的 Convert Scene Unit 处理） |
-| UE 2×1×0.5m 长方体 → Blender | 仍是 **2 × 1 × 0.5 m** ✅ |
-| Blender → Maya（1m 立方体） | 导入后为 **100cm**，往返无损 ✅ |
-| UE → Blender（旧 `global_scale=0.01`） | 缩小 100 倍 ❌（错误，已修正为 `1.0`） |
+| 场景                                  | 实测结果                                                          |
+| ----------------------------------- | ------------------------------------------------------------- |
+| Blender 1m 立方体 → UE                 | **100 × 100 × 100 cm** ✅（正确，米→厘米由 UE 的 Convert Scene Unit 处理） |
+| UE 2×1×0.5m 长方体 → Blender           | 仍是 **2 × 1 × 0.5 m** ✅                                        |
+| Blender → Maya（1m 立方体）              | 导入后为 **100cm**，往返无损 ✅                                         |
+| UE → Blender（旧 `global_scale=0.01`） | 缩小 100 倍 ❌（错误，已修正为 `1.0`）                                     |
+
 
 各路线缩放系数（都在 `shared/profiles.json` 里）：
 
@@ -347,7 +385,7 @@ abu.send_selected_assets("blender")
 # 1) 改 E:\CirnoWorkSpace\AssetBridge\shared\profiles.json
 # 2) 同步到各适配器副本
 python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py --sync
-# 3) 顺手做一次一致性自检（4 份 × 18 个关键字段）
+# 3) 顺手做一次一致性自检（6 份 × 30 个关键字段）
 python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
 ```
 

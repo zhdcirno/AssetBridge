@@ -571,7 +571,7 @@ def export_selection(path, profile):
 # ---------------------------------------------------------------------------
 
 
-def send_selection(target_app="unreal", note=""):
+def send_selection(target_app="unreal", note="", mode="update"):
     sel = cmds.ls(selection=True, long=True) or []
     if not sel:
         cmds.warning("[bridge] 没有选中对象")
@@ -592,7 +592,9 @@ def send_selection(target_app="unreal", note=""):
         "format": "fbx",
         "to": {"app": target_app, "project": CONFIG["project"], "content_path": "/Game/Bridge"},
         "unit": {"scene_unit": "cm", "up_axis": "Y", "forward_axis": "Z", "unit_scale": 1.0},
-        "options": {"mode": "update", "import_materials": True, "import_textures": True},
+        # Toolbag 目标时 mode = bake/render（Toolbag 适配器据此分流）；
+        # 其他目标保持 update（覆盖更新）
+        "options": {"mode": mode, "import_materials": True, "import_textures": True},
         "objects": [{"name": s.split("|")[-1], "type": cmds.nodeType(s)} for s in sel],
         "note": note,
     }
@@ -629,15 +631,192 @@ def send_selection(target_app="unreal", note=""):
     return 1
 
 
+def _texture_files_from_selection():
+    """收集选中对象用到的贴图文件（file 节点的 fileTextureName）。
+
+    优先选中对象 shadingEngine -> shader 上游的 file 节点；
+    没有选中/取不到时退化为场景里所有 file 节点。
+    返回去重后的 [(显示名, 绝对路径)]。
+    """
+    file_nodes = []
+    sel = cmds.ls(selection=True, long=True) or []
+    for s in sel:
+        shapes = cmds.listRelatives(s, shapes=True, fullPath=True) or []
+        if cmds.nodeType(s) == "mesh":
+            shapes.append(s)
+        for sh in shapes:
+            try:
+                sgs = cmds.listConnections(sh, type="shadingEngine") or []
+            except Exception:
+                sgs = []
+            for sg in sgs:
+                try:
+                    shaders = cmds.listConnections(sg + ".surfaceShader",
+                                                   source=True, destination=False) or []
+                except Exception:
+                    shaders = []
+                for shd in shaders:
+                    try:
+                        ups = cmds.listConnections(shd, source=True,
+                                                   destination=False,
+                                                   type="file") or []
+                    except Exception:
+                        ups = []
+                    for n in ups:
+                        if n not in file_nodes:
+                            file_nodes.append(n)
+    if not file_nodes:
+        try:
+            file_nodes = list(cmds.ls(type="file") or [])
+        except Exception:
+            file_nodes = []
+
+    out, seen = [], set()
+    for node in file_nodes:
+        try:
+            fp = cmds.getAttr(node + ".fileTextureName")
+        except Exception:
+            continue
+        if not fp:
+            continue
+        fp = os.path.abspath(fp)
+        base = os.path.basename(fp)
+        if base in seen or not os.path.isfile(fp):
+            continue
+        seen.add(base)
+        out.append((node, fp))
+    return out
+
+
+def send_textures(target_app="photoshop", note=""):
+    """把选中对象用到的贴图发给 Photoshop / SAI2（只能发贴图）。
+
+    保存后由编辑器守护进程回传，Maya 侧自动改 fileTextureName 重载。
+    """
+    if target_app not in ("photoshop", "sai2"):
+        cmds.warning("[bridge] 贴图发送只支持 photoshop / sai2")
+        return 0
+    items = _texture_files_from_selection()
+    if not items:
+        cmds.warning("[bridge] 没有找到可发送的贴图文件"
+                     "（选中带贴图材质的对象，或场景里先有 file 节点）")
+        return 0
+
+    first = items[0][1]
+    name = os.path.splitext(os.path.basename(first))[0]
+    if _to_ascii is not None:
+        name = _to_ascii(name)
+    ext = os.path.splitext(first)[1].lstrip(".").lower() or "png"
+
+    meta = {
+        "asset_name": name,
+        "kind": "textures",
+        "format": ext,
+        "to": {"app": target_app, "project": CONFIG["project"], "content_path": ""},
+        "options": {"editor": target_app},
+        "objects": [{"name": n, "type": "file"} for n, _ in items],
+        "note": note,
+    }
+    rec = _req("POST", "/transfers", meta)["transfer"]
+    tid = rec["id"]
+    name = rec.get("asset_name") or name
+
+    pd = payload_dir()
+    if pd:
+        out = os.path.join(pd, tid)
+        if not os.path.isdir(out):
+            os.makedirs(out)
+        for _n, fp in items:
+            shutil.copy2(fp, os.path.join(out, os.path.basename(fp)))
+    else:
+        for _n, fp in items:
+            with open(fp, "rb") as fh:
+                blob = fh.read()
+            _req("PUT", "/transfers/{0}/files/{1}".format(
+                tid, os.path.basename(fp)), data=blob, timeout=30.0)
+
+    rec = _req("POST", "/transfers/{0}/publish".format(tid), {})["transfer"]
+    cmds.warning("[bridge] 已发送 {0} 张贴图 -> {1} (rev {2})，保存后自动重载".format(
+        len(items), target_app, rec["revision"]))
+    return len(items)
+
+
 def _report(tid, status, result):
     """把导入结果交给后台线程去上报 finish（主线程只碰 Maya API）。"""
     if _result_queue is not None:
         _result_queue.put((tid, status, result))
 
 
+def _find_file_node_by_source(source_file):
+    """按贴图文件名找 Maya 场景里的 file 节点（保存回传重载用）。"""
+    if not source_file:
+        return None
+    stem = os.path.splitext(source_file)[0]
+    for node in (cmds.ls(type="file") or []):
+        try:
+            fp = cmds.getAttr(node + ".fileTextureName")
+        except Exception:
+            continue
+        if not fp:
+            continue
+        base = os.path.basename(fp)
+        if base == source_file or base == stem:
+            return node
+    return None
+
+
+def _handle_textures(record):
+    """主线程：处理贴图传输。
+
+    - options.return_of（PS/SAI2 保存回传）：找到原 file 节点，
+      改 fileTextureName 指向新文件（Maya 自动重载，节点连接不变）
+    - 普通贴图：新建 file + place2dTexture 节点
+    """
+    files = [f for f in (record.get("_files_abs") or [])
+             if f.lower().endswith((".png", ".psd", ".tga", ".jpg", ".jpeg",
+                                    ".bmp", ".exr", ".tif", ".tiff"))]
+    if not files:
+        raise RuntimeError("没有可处理的图片文件")
+
+    opts = record.get("options") or {}
+    return_of = opts.get("return_of")
+    source_file = str(opts.get("source_file") or "")
+    editor = str(opts.get("editor") or (record.get("from") or {}).get("app") or "")
+
+    reloaded, created = [], []
+    for f in files:
+        name = os.path.basename(f)
+        node = _find_file_node_by_source(source_file) if return_of else None
+        if node is not None:
+            cmds.setAttr(node + ".fileTextureName", f, type="string")
+            reloaded.append(node)
+            continue
+        node = cmds.shadingNode("file", asTexture=True, name="ab_bridge_{0}".format(
+            os.path.splitext(name)[0]))
+        cmds.setAttr(node + ".fileTextureName", f, type="string")
+        try:
+            p2d = cmds.shadingNode("place2dTexture", asUtility=True)
+            cmds.connectAttr(p2d + ".outUV", node + ".uv")
+            cmds.connectAttr(p2d + ".outUvFilterSize", node + ".uvFilterSize")
+        except Exception:
+            pass
+        created.append(node)
+
+    if reloaded and not created:
+        msg = "{0} 保存后已重载: {1}".format(editor or "编辑器", ", ".join(reloaded))
+    elif created and not reloaded:
+        msg = "已创建贴图节点: {0}".format(", ".join(created))
+    else:
+        msg = "重载 {0}；新建 {1}".format(", ".join(reloaded), ", ".join(created))
+    _report(record["id"], "done", {"message": msg, "nodes": reloaded + created})
+
+
 def _handle(record):
     """在主线程执行真正的 Maya 导入（只碰 cmds），结果交后台线程上报。"""
     try:
+        if str(record.get("kind", "")).lower() == "textures":
+            _handle_textures(record)
+            return
         files = record.get("_files_abs") or []
         fbx = [f for f in files if f.lower().endswith((".fbx", ".obj"))]
         if not fbx:
@@ -991,12 +1170,27 @@ def _ui_stop():
 def _ui_send(tgt_menu):
     tgt = cmds.optionMenu(tgt_menu, query=True, value=True) or "unreal"
     note = cmds.textFieldGrp("abNoteField", query=True, text=True) or ""
+    mode = "update"
+    if tgt == "toolbag" and cmds.optionMenu("abToolbagModeMenu", exists=True):
+        mode = cmds.optionMenu("abToolbagModeMenu", query=True, value=True) or "bake"
     try:
-        n = send_selection(target_app=tgt, note=note)
+        n = send_selection(target_app=tgt, note=note, mode=mode)
     except Exception as exc:
         cmds.warning("[bridge] 发送失败: {0}".format(exc))
         return
     cmds.warning("[bridge] 已发送 {0} 个对象 -> {1}".format(n, tgt))
+
+
+def _ui_send_textures(tgt_menu):
+    tgt = cmds.optionMenu(tgt_menu, query=True, value=True) or "photoshop"
+    note = cmds.textFieldGrp("abNoteField", query=True, text=True) or ""
+    try:
+        n = send_textures(target_app=tgt, note=note)
+    except Exception as exc:
+        cmds.warning("[bridge] 贴图发送失败: {0}".format(exc))
+        return
+    if n:
+        cmds.warning("[bridge] 已发送 {0} 张贴图 -> {1}（保存后自动重载）".format(n, tgt))
 
 
 def _ui_send_groom(tgt_menu):
@@ -1113,11 +1307,25 @@ def show_panel():
     cmds.frameLayout(label="发送（选中对象）", collapsable=False,
                     marginWidth=6, marginHeight=6)
     tgt = cmds.optionMenu("abTargetMenu", label="目标软件")
-    for _app in ("unreal", "blender", "substance_painter", "maya"):
+    for _app in ("unreal", "blender", "substance_painter", "maya",
+                 "toolbag", "photoshop", "sai2"):
         cmds.menuItem(label=_app)
+    # Toolbag 模式（仅目标为 toolbag 时生效）：烘焙=建烘焙组+烘焙回传SP；渲染=只导入
+    cmds.optionMenu("abToolbagModeMenu", label="Toolbag 模式")
+    cmds.menuItem(label="bake")
+    cmds.menuItem(label="render")
     cmds.textFieldGrp("abNoteField", label="备注", text="")
     cmds.button(label="发送选中对象", command=lambda *a: _ui_send(tgt))
     cmds.text(label="备注随资产发给对方，仅作说明(给人看)", align="left")
+    cmds.setParent("..")
+
+    cmds.separator(style="single", height=8)
+
+    cmds.frameLayout(label="发送贴图（Photoshop / SAI2）", collapsable=False,
+                    marginWidth=6, marginHeight=6)
+    cmds.text(label="用上面的目标菜单选 photoshop / sai2；"
+                    "在编辑器里保存后 Maya 自动重载", align="left")
+    cmds.button(label="发送贴图到编辑器", command=lambda *a: _ui_send_textures(tgt))
     cmds.setParent("..")
 
     cmds.separator(style="single", height=8)

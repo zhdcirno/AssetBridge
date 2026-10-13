@@ -8,7 +8,7 @@ Row {
     spacing: 2
 
     signal pullClicked()
-    signal pushClicked(string app)   // 回传给谁：unreal / blender / maya
+    signal pushClicked(string app)   // 回传给谁：unreal / blender / maya / photoshop / sai2
 
     // 连接状态（文字 + 颜色），每 2 秒探测一次中转服务
     property bool bridgeConnected: false
@@ -71,5 +71,19 @@ Row {
         tooltip: "把当前工程的贴图回传给 Maya"
         text: "回传→Maya"
         onClicked: root.pushClicked("maya")
+    }
+
+    // 回传给外部图像编辑器（Photoshop / SAI2）：
+    // 中转服务会调起编辑器打开这些贴图，保存后自动回传给发送端重载。
+    AlgButton {
+        tooltip: "把当前工程的贴图发送到 Photoshop 精修（保存后自动回传）"
+        text: "回传→PS"
+        onClicked: root.pushClicked("photoshop")
+    }
+
+    AlgButton {
+        tooltip: "把当前工程的贴图发送到 SAI2 精修（保存后自动回传）"
+        text: "回传→SAI2"
+        onClicked: root.pushClicked("sai2")
     }
 }

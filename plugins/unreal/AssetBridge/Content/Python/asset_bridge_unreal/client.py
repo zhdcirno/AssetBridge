@@ -99,6 +99,8 @@ class BridgeClient:
         meta.setdefault("id", uuid.uuid4().hex)
         meta.setdefault("from", {})
         meta["from"].update({"app": self.app, "version": self.version})
+        # from.project 供「编辑器保存后回传」定位发送端工程（PS/SAI2 守护用）
+        meta["from"].setdefault("project", self.project)
         return self._request("POST", "/transfers", meta)["transfer"]
 
     def put_file(self, transfer_id: str, file_path) -> dict:
