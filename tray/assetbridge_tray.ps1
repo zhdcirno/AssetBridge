@@ -619,7 +619,7 @@ $miEdStop   = $menu.Items.Add('停止编辑器守护')
 # 右键菜单常驻一项「复制最近一次 ZBrush 接收路径」（Popup 时读 notify.json 刷新）
 $miZbRecv   = $menu.Items.Add('复制最近一次 ZBrush 接收路径')
 $miZbRecv.Enabled = $false
-$menu.add_Popup({
+$menu.add_Opening({
     $has = $false
     $nf = Join-Path $EDITOR_STATE 'notify.json'
     if (Test-Path $nf) {

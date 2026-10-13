@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
-"""托盘新增功能无头自检：Find-Toolbag / Find-Photoshop / Find-Sai2 /
-Resolve-ManualApp（三个新 key）/ Update-EditorDaemonConfig / 菜单结构 / 守护状态。
+"""托盘新增功能无头自检：Find-Toolbag / Find-Photoshop / Find-Sai2 / Find-ZBrush /
+Resolve-ManualApp（新 key）/ Update-EditorDaemonConfig / 菜单结构 / 守护状态
++ **启动路径运行时冒烟**（抓 ParseFile 抓不到的 MethodNotFound 类错误）。
 
-做法：把 assetbridge_tray.ps1 切两段再拼接成可 dot-source 的切片：
+切片自检做法：把 assetbridge_tray.ps1 切两段再拼接成可 dot-source 的切片：
    head：常量 + Add-Type + 辅助函数 + trap（改为 continue，非致命）
    tail：从「function Exit-Tray」起到「# ---- 启动」之前的所有函数 + 顶层 GUI 对象
 中间的单实例检查（互斥量 + exit）必须跳过——真实托盘若正在运行，它会直接 exit，
 后面所有函数都不会定义。不进消息循环、不弹窗。
+
+运行时冒烟（2026-10-13 教训：add_Popup 事件在 ContextMenuStrip 上不存在，
+ParseFile 0 错误但托盘一启动就崩）：原样执行托盘脚本到 Application.Run() 之前的
+全部顶层语句，把 Run() 换成有界 DoEvents pump，再执行原收尾语句。判定：
+  - 子进程正常结束；
+  - tray.log 期间没有新增「未处理异常」；
+  - 至少出现一条新的「托盘启动」。
+副作用说明：若中转服务没在运行，冒烟会把服务拉起来（与真实托盘行为一致）。
 """
 import io
 import json
@@ -152,4 +161,76 @@ for p in (runner, test_path, slice_path):
     except OSError:
         pass
 print(out)
-sys.exit(proc.returncode)
+slice_rc = proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# 启动路径运行时冒烟：真跑一遍（有界消息泵），抓 MethodNotFound 类运行时错误
+# ---------------------------------------------------------------------------
+
+TRAY_LOG = os.path.join(ROOT, "logs", "tray.log")
+
+
+def _log_size():
+    try:
+        return os.path.getsize(TRAY_LOG)
+    except OSError:
+        return 0
+
+
+def _log_delta(before_size):
+    try:
+        with open(TRAY_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(before_size)
+            return fh.read()
+    except OSError:
+        return ""
+
+
+smoke_wrapper = os.path.join(HERE, "_tray_smoke_run.ps1")
+smoke_src = io.open(PS1, encoding="utf-8-sig").read()
+run_mark = "[System.Windows.Forms.Application]::Run()"
+ri = smoke_src.index(run_mark)
+pump = ("\n# ==== 运行时冒烟：有界消息泵（替代 Application.Run）====\n"
+        "$smokeStart = Get-Date\n"
+        "while (((Get-Date) - $smokeStart).TotalSeconds -lt 12) {\n"
+        "    [System.Windows.Forms.Application]::DoEvents()\n"
+        "    Start-Sleep -Milliseconds 100\n"
+        "}\n")
+smoke_body = smoke_src[:ri] + pump + smoke_src[ri + len(run_mark):]
+with io.open(smoke_wrapper, "w", encoding="utf-8-sig") as fh:
+    fh.write(smoke_body)
+
+log_before = _log_size()
+smoke_proc = subprocess.run(
+    [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+     "-File", smoke_wrapper],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=150)
+delta = _log_delta(log_before)
+try:
+    os.remove(smoke_wrapper)
+except OSError:
+    pass
+
+problems = []
+if smoke_proc.returncode != 0:
+    problems.append("冒烟子进程退出码 {0}: {1}".format(
+        smoke_proc.returncode,
+        smoke_proc.stdout.decode("utf-8", "replace")[-800:]))
+if "未处理异常" in delta:
+    problems.append("启动路径出现未处理异常:\n" + delta[-800:])
+if "托盘启动 port=" not in delta:
+    problems.append("未见到新的「托盘启动」日志，启动路径可能没跑到底")
+
+print("=== runtime smoke ===")
+print("subprocess_rc={0} new_log_bytes={1}".format(smoke_proc.returncode, len(delta)))
+if delta:
+    print("--- new tray.log lines ---")
+    print(delta[-600:])
+if problems:
+    print("RUNTIME_SMOKE_FAIL:")
+    for p in problems:
+        print("  " + p)
+    sys.exit(1)
+print("RUNTIME_SMOKE_OK")
+sys.exit(slice_rc)
