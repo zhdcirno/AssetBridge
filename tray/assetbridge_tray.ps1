@@ -95,13 +95,14 @@ function Log([string]$m) {
     } catch { }
 }
 
-function Get-AbImage([string]$file) {
+function Get-AbImage([string]$file, [string]$src = $ICONSRC) {
     # 状态窗按钮上的小图标。读不到就返回 $null（按钮不显示图标，不影响功能）。
+    # $src 默认 $ICONSRC（assets\icons\png\16）；安装器行内 20px 图标传 tray\icons。
     #
     # 注意：不能用 Image.FromFile —— 它会一直**锁住文件**，导致生成脚本无法覆盖重写。
     # 这里读成字节流再拷一份 Bitmap，既不锁文件也不受流生命周期影响。
     try {
-        $p = Join-Path $ICONSRC $file
+        $p = Join-Path $src $file
         if (-not (Test-Path $p)) { return $null }
         $bytes = [System.IO.File]::ReadAllBytes($p)
         $ms = New-Object System.IO.MemoryStream(,$bytes)
@@ -1834,6 +1835,7 @@ $script:IReport       = $null
 $script:IStatus       = $null
 $script:IInstallBtns  = @{}
 $script:IUninstallBtns = @{}
+$script:IStatusLabel  = @{}
 $script:IApps         = @()
 
 function Update-InstallerUI {
@@ -1849,11 +1851,20 @@ function Update-InstallerUI {
             $lines += ("{0,-18} 未检测到（可点下方『指定』按钮手动选择）" -f $meta.n)
             if ($ib) { $ib.Enabled = $false; $ib.Text = '安装 ' + $meta.s }
             if ($ub) { $ub.Enabled = $false }
+            $sl = $script:IStatusLabel[$meta.k]
+            if ($sl) { $sl.Text = '未检测到' }
             $lines += ''
             continue
         }
         $st   = Get-InstallState $a
         if ($a.noinstall) { $st.text = '无需安装插件（由编辑器守护调用）' }
+        # 行内短标签（完整状态仍在顶部报告里）
+        $short = if ($a.noinstall) { '无需装' }
+                 elseif ($st.latest) { '已安装' }
+                 elseif ($st.installed) { '可重装' }
+                 else { '未安装' }
+        $sl = $script:IStatusLabel[$meta.k]
+        if ($sl) { $sl.Text = $short }
         $flag = if ($a.ok) { '✓ 可安装' } else { '✗ 不可安装' }
         $lines += ("{0,-18} {1,-10} [{2}] {3}" -f $meta.n, ('v' + $a.version), $flag, $st.text)
         if ($a.path) { $lines += ("   程序: " + $a.path) }
@@ -1882,86 +1893,92 @@ function Update-InstallerUI {
 function Show-Installer {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Asset Bridge 插件安装器'
-    $form.ClientSize = New-Object System.Drawing.Size(560, 726)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 644)
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
 
     $report = New-Object System.Windows.Forms.TextBox
-    $report.SetBounds(14, 14, 532, 300)
+    $report.SetBounds(14, 14, 532, 240)
     $report.Multiline = $true; $report.ReadOnly = $true; $report.ScrollBars = 'Vertical'
     $report.Font = New-Object System.Drawing.Font('Consolas', 9)
     $form.Controls.Add($report)
 
     $status = New-Object System.Windows.Forms.Label
-    $status.SetBounds(14, 320, 532, 20)
+    $status.SetBounds(14, 262, 532, 20)
     $form.Controls.Add($status)
 
     $bRefresh = New-Object System.Windows.Forms.Button
-    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 344, 100, 30)
+    $bRefresh.Text = '刷新检测'; $bRefresh.SetBounds(14, 288, 100, 30)
     $form.Controls.Add($bRefresh)
 
     $bDl = New-Object System.Windows.Forms.Button
-    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 344, 160, 30)
+    $bDl.Text = '从 GitHub 下载最新版'; $bDl.SetBounds(124, 288, 160, 30)
     $form.Controls.Add($bDl)
 
     $bInstall = @{}
     $bUninstall = @{}
     $bManual = @{}
+    $bStatus = @{}
 
-    # 按钮统一参数：一行 4 个（宽 132 + 间隔 4），7 个软件自动换行
-    $btnX0 = 14; $btnStep = 136; $btnW = 132; $btnH = 30
-    $colCount = 4
+    # 每软件一行：[软件名 88] [主按钮 190x28] [指定📁 34x28] [卸载🗑 34x28] [状态 120]
+    # 21 个按钮从「三组纵排」压成 7 行，消除窗口溢出。主按钮文字与事件回调逻辑不变。
+    $rowY0 = 352; $rowH = 34
+    $tip = New-Object System.Windows.Forms.ToolTip
+    $tip.AutoPopDelay = 8000; $tip.InitialDelay = 400; $tip.ReshowDelay = 100
+    $iconSrc20 = Join-Path $ScriptDir 'icons'   # 20px 行内图标（act_folder/act_trash）
 
     $lbl1 = New-Object System.Windows.Forms.Label
-    $lbl1.Text = '一键安装 / 更新（检测到且版本达标时可用；PS/SAI2 为「同步守护配置」）：'; $lbl1.SetBounds(14, 382, 532, 18)
+    $lbl1.Text = '按软件操作（每行一个软件）：'; $lbl1.SetBounds(14, 328, 532, 18)
     $form.Controls.Add($lbl1)
     $idx = 0
     foreach ($meta in $AB_APPS_META) {
-        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
-        $by = 404 + (38 * [int]($idx / $colCount))
+        $by = $rowY0 + ($rowH * $idx)
+
+        $nl = New-Object System.Windows.Forms.Label
+        $nl.Text = $meta.s; $nl.TextAlign = 'MiddleLeft'
+        $nl.SetBounds(14, $by + 4, 88, 22)
+        $form.Controls.Add($nl)
+
         $b = New-Object System.Windows.Forms.Button
-        $b.Text = '安装 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
+        $b.Text = '安装 ' + $meta.s; $b.SetBounds(106, $by, 190, 28)
         $b.Enabled = $false
         $b.Tag = $meta.k
+        $tip.SetToolTip($b, ('一键安装/更新 {0} 插件（PS/SAI2 为同步守护配置）' -f $meta.n))
         $bInstall[$meta.k] = $b
         $form.Controls.Add($b)
-        $idx++
-    }
 
-    $lbl2 = New-Object System.Windows.Forms.Label
-    $lbl2.Text = '卸载插件（先备份到 backups/，可回滚）：'; $lbl2.SetBounds(14, 486, 532, 18)
-    $form.Controls.Add($lbl2)
-    $idx = 0
-    foreach ($meta in $AB_APPS_META) {
-        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
-        $by = 508 + (38 * [int]($idx / $colCount))
-        $b = New-Object System.Windows.Forms.Button
-        $b.Text = '卸载 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
-        $b.Enabled = $false
-        $b.Tag = $meta.k
-        $bUninstall[$meta.k] = $b
-        $form.Controls.Add($b)
-        $idx++
-    }
+        $bm = New-Object System.Windows.Forms.Button
+        $bm.Text = '📁'; $bm.SetBounds(302, $by, 34, 28)
+        $bm.Tag = $meta.k
+        $imgF = Get-AbImage 'act_folder.png' $iconSrc20
+        if ($imgF -ne $null) { $bm.Text = ''; $bm.Image = $imgF; $bm.ImageAlign = 'MiddleCenter' }
+        $tip.SetToolTip($bm, ('手动指定 {0} 的安装路径（UE 请选引擎根目录），指定后永久记住' -f $meta.n))
+        $bManual[$meta.k] = $bm
+        $form.Controls.Add($bm)
 
-    $lbl3 = New-Object System.Windows.Forms.Label
-    $lbl3.Text = '未检测到？手动指定安装路径（UE 请选引擎根目录）：'; $lbl3.SetBounds(14, 590, 532, 18)
-    $form.Controls.Add($lbl3)
-    $idx = 0
-    foreach ($meta in $AB_APPS_META) {
-        $bx = $btnX0 + ($btnStep * ($idx % $colCount))
-        $by = 612 + (38 * [int]($idx / $colCount))
-        $b = New-Object System.Windows.Forms.Button
-        $b.Text = '指定 ' + $meta.s; $b.SetBounds($bx, $by, $btnW, $btnH)
-        $b.Tag = $meta.k
-        $bManual[$meta.k] = $b
-        $form.Controls.Add($b)
+        $bu = New-Object System.Windows.Forms.Button
+        $bu.Text = '🗑'; $bu.SetBounds(340, $by, 34, 28)
+        $bu.Enabled = $false
+        $bu.Tag = $meta.k
+        $imgT = Get-AbImage 'act_trash.png' $iconSrc20
+        if ($imgT -ne $null) { $bu.Text = ''; $bu.Image = $imgT; $bu.ImageAlign = 'MiddleCenter' }
+        $tip.SetToolTip($bu, ('卸载 {0} 的插件（先备份到 backups/，可回滚）' -f $meta.n))
+        $bUninstall[$meta.k] = $bu
+        $form.Controls.Add($bu)
+
+        $sl = New-Object System.Windows.Forms.Label
+        $sl.Text = ''; $sl.TextAlign = 'MiddleLeft'
+        $sl.ForeColor = [System.Drawing.Color]::Gray
+        $sl.SetBounds(382, $by + 4, 120, 22)
+        $bStatus[$meta.k] = $sl
+        $form.Controls.Add($sl)
+
         $idx++
     }
 
     $bClose = New-Object System.Windows.Forms.Button
-    $bClose.Text = '关闭'; $bClose.SetBounds(232, 682, 96, 30)
+    $bClose.Text = '关闭'; $bClose.SetBounds(232, 600, 96, 30)
     $bClose.add_Click({ $form.Close() })
     $form.Controls.Add($bClose)
 
@@ -1970,6 +1987,7 @@ function Show-Installer {
     $script:IStatus        = $status
     $script:IInstallBtns   = $bInstall
     $script:IUninstallBtns = $bUninstall
+    $script:IStatusLabel   = $bStatus
 
     $bRefresh.add_Click({
         $script:IStatus.Text = '正在检测...'
