@@ -34,6 +34,7 @@ COPIES = {
     / "asset_bridge_unreal" / "profiles.json",
     "maya": ROOT / "plugins" / "maya" / "asset_bridge_maya" / "profiles.json",
     "toolbag": ROOT / "plugins" / "toolbag" / "asset_bridge" / "profiles.json",
+    "zbrush": ROOT / "plugins" / "zbrush" / "asset_bridge_zbrush" / "profiles.json",
 }
 
 # 需要做一致性比对的路径（点分）
@@ -66,6 +67,16 @@ CHECK_PATHS = [
     "routes.blender>photoshop.kind",
     "routes.blender>sai2.kind",
     "routes.sai2>blender.kind",
+    "apps.zbrush.unit",
+    "apps.zbrush.formats",
+    "apps.zbrush.script_lang",
+    "routes.zbrush>blender.format",
+    "routes.zbrush>blender.export.global_scale",
+    "routes.zbrush>blender.kind",
+    "routes.blender>zbrush.format",
+    "routes.blender>zbrush.export.global_scale",
+    "routes.blender>zbrush.kind",
+    "routes.zbrush>unreal.import.import_uniform_scale",
     "naming.static_mesh",
     "naming.skeletal_mesh",
 ]

@@ -243,6 +243,30 @@ python server/server.py --root runtime --port 27631
 
 安装器里 Photoshop / SAI2 的「安装」按钮只是把 exe 路径同步进 `tools/editor_daemon.json`（标 `无需安装插件`）。
 
+### ZBrush 2026.1+（Python 适配器 + 守护进程握手）
+
+ZBrush 2026.1 起有官方 Python SDK（`zbrush.commands`；2025.x 只有 ZScript，不支持）。
+关键约束：**内嵌 VM 的 GIL 在主线程，zbc 只能在主线程调用**——适配器因此采用
+「**主线程 serve 循环**」（迭代间 `zbc.update(1, True)` pump UI，停止按钮可随时打断），
+无常驻后台线程。
+
+1. **安装**：插件拷到**用户资产目录** `%APPDATA%\Maxon\Zbrush<版本>_<哈希>\ZStartup\ZPlugs64\asset_bridge_zbrush`
+   （2026.1 起安装目录只读）；安装器写 `ab_config.json` 并往 `ZData\Python\init.py`
+   注入自动加载钩子（marker 包裹、幂等；注入失败可 `ZScript>Python` 面板手动 Load Script）。
+2. **接收**（其他软件 → ZBrush）：守护进程 claim 后写 `<payload>\zbrush_inbox\<tid>.json`
+   任务文件 → serve 循环主线程 `set_next_filename + Tool:Import` 免对话框导入 →
+   写 `<tid>.done.json` 回执，任务文件消费后即删。ZBrush 未运行时守护进程用
+   `Popen([ZBrush.exe, "-script", one_shot_import.py, ...])` 一次性导入兜底；
+   运行中但桥接未启动 → 落盘 + 托盘气泡（路径一键复制）+ `Tool:Load` 手动加载。
+3. **发送**（ZBrush → 其他软件）：`发送当前模型` / `发送回最近发送者` 按钮 →
+   `set_next_filename + Tool:Export` 免对话框导出 → HTTP 建传输/上传/publish；
+   热文件夹 `<payload>\zbrush_outbox\` 兜底（守护进程自动回传）。
+4. **单位**：OBJ 不带单位，ZBrush 导出按导入时记录的 Scale/Offset 还原原始数值，
+   `global_scale=1.0` 透传（1m 立方往返实测）。ZBrush **无保存事件钩子**，发送为手动触发语义。
+
+⚠️ 同目录单实例：ZBrush 已运行再拉起会被拒——所以守护进程先用
+`<payload>\zb_bridge.heartbeat`（freshness ≤12s）判断常驻桥接是否活着，再决定握手还是兜底。
+
 ### 托盘自身的设置
 
 右键托盘 → **设置**：服务端口、自检间隔、中转文件路径。中转路径旁可「打开文件夹」或
@@ -261,9 +285,10 @@ python server/server.py --root runtime --port 27631
 | Maya 适配器    | ✅ 完成（发送 / 接收 / 发贴图到编辑器 / 重载），userSetup 自启 |
 | SP 适配器      | ✅ 完成（接收模型 / 回传贴图 / 接收 `kind=textures` / 回传目标含 PS·SAI2） |
 | Toolbag 适配器  | ✅ 完成（bake / render 两模式；烘焙回传 SP）            |
-| 编辑器守护进程    | ✅ 完成（PS/SAI2 打开贴图 → 监听保存 → 自动回传 + 重载）     |
-| 托盘守护        | ✅ 完成（四态图标 / 看门狗自动拉起 / HTTP 优雅关服 / 编辑器守护菜单） |
-| 插件安装器       | ✅ 完成（七软件多源探测 / 版本门槛 / 安装·更新·卸载 / 手动路径记忆 / GitHub 下载 / Toolbag 部署） |
+| ZBrush 适配器   | ✅ 完成（2026.1+ Python 主线程 serve 循环；inbox 握手接收 / 按钮+热文件夹发送 / 1m 立方单位实测） |
+| 编辑器守护进程    | ✅ 完成（PS/SAI2 打开贴图 → 监听保存 → 自动回传 + 重载；ZBrush inbox 握手 + -script 兜底 + 热文件夹）     |
+| 托盘守护        | ✅ 完成（四态图标 / 看门狗自动拉起 / HTTP 优雅关服 / 编辑器守护菜单 / ZBrush 落盘气泡提示） |
+| 插件安装器       | ✅ 完成（八软件多源探测 / 版本门槛 / 安装·更新·卸载 / 手动路径记忆 / GitHub 下载 / Toolbag 部署 / ZBrush init.py 钩子注入） |
 
 下一步建议（按性价比排序）：
 

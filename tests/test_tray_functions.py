@@ -57,6 +57,18 @@ $out.find_toolbag    = $(try { $t = Find-Toolbag;    if ($t) { @{ ok=$t.ok; ver=
 $out.find_photoshop  = $(try { $t = Find-Photoshop;  if ($t) { @{ ok=$t.ok; ver=$t.version; path=$t.path; noinstall=$t.noinstall } } else { $null } } catch { @{ err = "" + $_ } })
 $out.find_sai2       = $(try { $t = Find-Sai2;       if ($t) { @{ ok=$t.ok; ver=$t.version; path=$t.path; noinstall=$t.noinstall } } else { $null } } catch { @{ err = "" + $_ } })
 
+# ---- ZBrush 探测 / 解析（本机 D:\DCC\Zbrush2026.2.1，用户资产目录在 AppData\Maxon） ----
+$out.find_zbrush = $(try { $t = Find-ZBrush; if ($t) { @{ ok=$t.ok; ver=$t.version; path=$t.path; targets=@($t.targets); note=[string]$t.note } } else { $null } } catch { @{ err = "" + $_ } })
+$zb = 'D:\DCC\Zbrush2026.2.1\ZBrush.exe'
+if (Test-Path -LiteralPath $zb) {
+    $r = Resolve-ManualApp 'zbrush' $zb
+    $out.resolve_zbrush = @{ ok = [bool]$r.ok; ver = $r.version; src = $r.src; min = $r.min; target0 = @($r.targets)[0] }
+} else { $out.resolve_zbrush = 'NOT-INSTALLED' }
+$out.resolve_zbrush_bad = $($null -eq (Resolve-ManualApp 'zbrush' 'C:\Windows\notepad.exe'))
+# 用户目录版本过滤：2024 旧版用户目录不应被匹配（大小写 [Bb]rush 正则 + 版本门槛）
+$out.zb_userdir_2026 = $(try { [string](Get-ZBrushUserDirByVersion '2026.2.1') } catch { '' })
+$out.zb_userdir_2024 = $(try { if (Get-ZBrushUserDirByVersion '2024.0.4') { 'FOUND(不该)' } else { 'correctly-skipped' } } catch { '' })
+
 # ---- 菜单结构：编辑器守护三项应在 ----
 $out.menu_has_editor = $($miEdState -ne $null -and $miEdStart -ne $null -and $miEdStop -ne $null)
 $out.menu_item_count = $($menu.Items.Count)
@@ -93,11 +105,13 @@ if (Test-Path -LiteralPath 'D:\DCC\Toolbag 5') {
 # ---- Update-EditorDaemonConfig：手动路径优先写进 editor_daemon.json ----
 $script:ManualPaths['photoshop'] = $ps
 $script:ManualPaths['sai2'] = $sai
+if (Test-Path -LiteralPath 'D:\DCC\Zbrush2026.2.1\ZBrush.exe') { $script:ManualPaths['zbrush'] = 'D:\DCC\Zbrush2026.2.1\ZBrush.exe' }
 Update-EditorDaemonConfig
 $cfgPath = Join-Path $ROOT 'tools\editor_daemon.json'
 $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $out.daemon_cfg_photoshop = [string]$cfg.apps.photoshop
 $out.daemon_cfg_sai2 = [string]$cfg.apps.sai2
+$out.daemon_cfg_zbrush = [string]$cfg.apps.zbrush
 $out.daemon_cfg_server = [string]$cfg.server_url
 
 # ---- Get-EditorDaemonStatusText：未运行时应给明确文案 ----

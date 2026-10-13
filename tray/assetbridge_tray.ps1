@@ -186,6 +186,7 @@ $script:Interval = 10
 $script:Guard    = $true
 $script:LastUp   = $false
 $script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服务端 /api/v1/config 取
+$script:AbNotifyPath = ''  # D3：最近一次 ZBrush 接收的文件路径（气泡点击/菜单复制用）
 $script:PidCache   = @{ pid = 0; ts = 0 }   # Get-ServerPid 的缓存（见该函数内的性能说明）
 # 手动指定的软件路径 { key -> exe / 引擎根目录 }，持久化在 tray_config.json 的 manual_paths。
 # 自动检测漏掉的软件（如装在非标准位置的 Maya）指定一次后就记住，刷新/重开安装器仍然认。
@@ -489,6 +490,14 @@ function Get-EditorDaemonStatusText {
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $ni = New-Object System.Windows.Forms.NotifyIcon
+# D3：气泡被点击 -> 复制 ZBrush 接收路径（Win11 toast 下可能不触发，故有菜单兜底）
+$ni.add_BalloonTipClicked({
+    if ($script:AbNotifyPath) {
+        try { Set-Clipboard -Value $script:AbNotifyPath } catch { }
+        try { $ni.ShowBalloonTip(3000, 'AssetBridge', '路径已复制到剪贴板', 'Info') } catch { }
+        $script:AbNotifyPath = ''
+    }
+})
 $script:IconCache = @{}          # 状态 -> @{ ts=文件时间戳; icon=Icon 对象 }
 function Apply-Icon([string]$state) {
     # 四态：ok=绿 / warn=琥珀 / paused=灰 / down=红（读不到文件时退回系统图标）
@@ -606,6 +615,35 @@ $miEdState  = $menu.Items.Add('编辑器守护：检查中...')
 $miEdState.Enabled = $false
 $miEdStart  = $menu.Items.Add('启动编辑器守护（PS/SAI2 回传）')
 $miEdStop   = $menu.Items.Add('停止编辑器守护')
+# D3 兜底：ZBrush 落盘通知的气泡点击在部分 Win11 上不触发，
+# 右键菜单常驻一项「复制最近一次 ZBrush 接收路径」（Popup 时读 notify.json 刷新）
+$miZbRecv   = $menu.Items.Add('复制最近一次 ZBrush 接收路径')
+$miZbRecv.Enabled = $false
+$menu.add_Popup({
+    $has = $false
+    $nf = Join-Path $EDITOR_STATE 'notify.json'
+    if (Test-Path $nf) {
+        try {
+            $nj = Get-Content $nf -Raw -Encoding UTF8 | ConvertFrom-Json
+            $script:AbNotifyPath = [string]$nj.path
+            if ($script:AbNotifyPath) {
+                $miZbRecv.Text = ('复制 ZBrush 接收路径：' + (Split-Path $script:AbNotifyPath -Leaf))
+                $miZbRecv.Enabled = $true
+                $has = $true
+            }
+        } catch { }
+    }
+    if (-not $has) {
+        $miZbRecv.Text = '复制最近一次 ZBrush 接收路径'
+        $miZbRecv.Enabled = $false
+    }
+})
+$miZbRecv.add_Click({
+    if ($script:AbNotifyPath) {
+        try { Set-Clipboard -Value $script:AbNotifyPath } catch { }
+        try { $ni.ShowBalloonTip(3000, 'AssetBridge', '路径已复制到剪贴板', 'Info') } catch { }
+    }
+})
 [void]$menu.Items.Add('-')
 $miLog     = $menu.Items.Add('打开托盘日志')
 $miSrvLog  = $menu.Items.Add('打开服务日志')
@@ -827,6 +865,7 @@ $MIN_SP       = '10.0.1'
 $MIN_SP_BUILD = 3757
 $MIN_UE       = '5.8'
 $MIN_TOOLBAG  = '5.0'   # 适配器用的是 Toolbag 5 的 mset API
+$MIN_ZBRUSH   = '2026.0'  # Python API 是 2026.0 才有的（2025.x 只有 ZScript）
 
 # 本机把 DCC 都装在各自盘的 DCC 目录下（用户习惯），一并纳入自动检测范围
 $DCC_ROOTS = @('D:\DCC', 'G:\DCC', 'E:\DCC', 'C:\DCC')
@@ -842,7 +881,8 @@ $AB_APPS_META = @(
     @{ k='ue';         n='Unreal Engine';     s='UE';         src='plugins/unreal/AssetBridge' },
     @{ k='toolbag';    n='Marmoset Toolbag';  s='Toolbag';    src='plugins/toolbag/asset_bridge' },
     @{ k='photoshop';  n='Photoshop';         s='PS';         src='' },
-    @{ k='sai2';       n='SAI2';              s='SAI2';       src='' }
+    @{ k='sai2';       n='SAI2';              s='SAI2';       src='' },
+    @{ k='zbrush';     n='ZBrush';            s='ZBrush';     src='plugins/zbrush/asset_bridge_zbrush' }
 )
 
 function Parse-Version([string]$s) {
@@ -1435,10 +1475,114 @@ function Find-Sai2 {
     }
     return $null
 }
+function Get-ZBrushUserDirByVersion([string]$ver) {
+    # 在 %APPDATA%\Maxon 下按版本找 ZBrush 用户资产目录
+    #（形如 Zbrush2026.2.1_01AC8E5C / ZBrush2024.0.4_8F683CC8，注意 b 大小写两版都有）。
+    # 版本门槛由调用方判；这里只做「年.次」前缀匹配，天然区分新旧两套。
+    if (-not $ver) { return $null }
+    $base = Join-Path $env:APPDATA 'Maxon'
+    if (-not (Test-Path $base)) { return $null }
+    $mm = (($ver -split '\.')[0..1]) -join '.'
+    foreach ($d in (Get-ChildItem $base -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -match '^Z[Bb]rush(\d+(?:\.\d+)*)_[0-9A-Fa-f]+$') {
+            $dv = $Matches[1]
+            $dmm = (($dv -split '\.')[0..1]) -join '.'
+            # 版本门槛内建在函数里（防呆）：低于 $MIN_ZBRUSH 的旧版用户目录一律不返回
+            if ($dmm -eq $mm -and (Ver-GE $dv $MIN_ZBRUSH)) { return $d.FullName }
+        }
+    }
+    return $null
+}
+function Find-ZBrush {
+    # 多源探测 ZBrush 2026.1+（适配器依赖官方 Python SDK，见 $MIN_ZBRUSH）：
+    #   ① 卸载注册表（DisplayName 带版本，InstallLocation/UninstallString 反推 exe）
+    #   ② 用户资产目录 glob（版本门槛过滤旧版；installpath.txt 交叉验证 exe）
+    #   ③ 固定路径 + 各盘 DCC 目录扫描
+    # targets = 各版本的用户 ZStartup\ZPlugs64\asset_bridge_zbrush（2026.1 起安装目录只读）
+    $found = @{}      # "年.次" -> @{ exe; ver; userDir }
+    $reg = {
+        param($exe, $ver, $userDir)
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { return }
+        if (-not $ver -and ($exe -match 'Z[Bb]rush[ _]?(\d{4}(?:\.\d+)*)')) { $ver = $Matches[1] }
+        if (-not $ver) { $ver = Get-ExeVer $exe }
+        if (-not $ver) { return }
+        if (-not (Ver-GE $ver $MIN_ZBRUSH)) { return }
+        $mm = (($ver -split '\.')[0..1]) -join '.'
+        if (-not $found.ContainsKey($mm)) { $found[$mm] = @{ exe = $exe; ver = $ver; userDir = $userDir } }
+    }
+    foreach ($rk in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+        foreach ($k in (Get-ItemProperty $rk -ErrorAction SilentlyContinue)) {
+            $n = [string]$k.DisplayName
+            if ($n -notmatch 'ZBrush\s*(\d{4}(?:\.\d+)*)') { continue }
+            $ver = $Matches[1]
+            $exe = ''
+            $il = [string]$k.InstallLocation
+            if ($il) {
+                $c = Join-Path $il 'ZBrush.exe'
+                if (Test-Path -LiteralPath $c) { $exe = $c }
+            }
+            if (-not $exe -and $k.UninstallString -match '^(.*?)\\Uninstall') {
+                $root = Split-Path (Split-Path $Matches[1])
+                $c = Join-Path $root 'ZBrush.exe'
+                if (Test-Path -LiteralPath $c) { $exe = $c }
+            }
+            if (-not $exe) { continue }
+            & $reg $exe $ver (Get-ZBrushUserDirByVersion $ver)
+        }
+    }
+    $maxonBase = Join-Path $env:APPDATA 'Maxon'
+    if (Test-Path $maxonBase) {
+        foreach ($d in (Get-ChildItem $maxonBase -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.Name -match '^Z[Bb]rush(\d+(?:\.\d+)*)_[0-9A-Fa-f]+$') {
+                $ver = $Matches[1]
+                if (-not (Ver-GE $ver $MIN_ZBRUSH)) { continue }
+                $ip = Join-Path $d.FullName 'installpath.txt'
+                if (Test-Path $ip) {
+                    $root = ''
+                    try { $root = ([string](Get-Content $ip -Raw -Encoding UTF8)).Trim() } catch { }
+                    if ($root) {
+                        $c = Join-Path $root 'ZBrush.exe'
+                        if (Test-Path -LiteralPath $c) { & $reg $c $ver $d.FullName }
+                    }
+                }
+            }
+        }
+    }
+    $roots = @('C:\Program Files\Maxon ZBrush 2026', 'C:\Program Files\Maxon ZBrush 2025') + $DCC_ROOTS
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        $c = Join-Path $r 'ZBrush.exe'
+        if (Test-Path -LiteralPath $c) { & $reg $c '' (Get-ZBrushUserDirByVersion (Get-ExeVer $c)) }
+        foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.Name -match '^Z[Bb]rush[ _]?(\d{4}(?:\.\d+)*)') {
+                $c2 = Join-Path $d.FullName 'ZBrush.exe'
+                if (Test-Path -LiteralPath $c2) { & $reg $c2 $Matches[1] (Get-ZBrushUserDirByVersion $Matches[1]) }
+            }
+        }
+    }
+    if ($found.Count -eq 0) { return $null }
+    $keys = @(Sort-VersionKeys $found.Keys)
+    $targets = @(); $notes = @()
+    foreach ($k in $keys) {
+        $ud = $found[$k].userDir
+        if (-not $ud) { $ud = Get-ZBrushUserDirByVersion $k }
+        if ($ud) {
+            $targets += (Join-Path $ud 'ZStartup\ZPlugs64\asset_bridge_zbrush')
+        } else {
+            $notes += "版本 $k 未找到用户资产目录（ZBrush 需至少完整运行过一次）"
+        }
+    }
+    return [PSCustomObject]@{
+        key='zbrush'; name='ZBrush'; version=($keys -join ','); path=$found[$keys[-1]].exe;
+        min=$MIN_ZBRUSH; src='plugins/zbrush/asset_bridge_zbrush';
+        targets=$targets; ok=($targets.Count -gt 0); note=($notes -join '；')
+    }
+}
 function Find-AllApps {
     $det = @()
     foreach ($fn in @('Find-Blender','Find-Maya','Find-SubstancePainter','Find-Unreal',
-                     'Find-Toolbag','Find-Photoshop','Find-Sai2')) {
+                     'Find-Toolbag','Find-Photoshop','Find-Sai2','Find-ZBrush')) {
         try {
             $r = & $fn
             if ($r) { $det += $r }
@@ -1498,7 +1642,7 @@ function Update-EditorDaemonConfig {
         foreach ($p in @($data.apps.PSObject.Properties)) { $apps[$p.Name] = [string]$p.Value }
     }
     $changed = $false
-    foreach ($k in @('photoshop', 'sai2')) {
+    foreach ($k in @('photoshop', 'sai2', 'zbrush')) {
         $exe = ''
         if ($script:ManualPaths.ContainsKey($k)) { $exe = [string]$script:ManualPaths[$k] }
         if (-not $exe) {
@@ -1521,6 +1665,93 @@ function Update-EditorDaemonConfig {
         Log ('已同步编辑器守护配置: ' + $cfgPath)
     } catch { Log ('写 editor_daemon.json 失败: {0}' -f $_) }
 }
+function Get-ZBrushHookBlock([string]$pluginDir) {
+    # init.py 注入块（marker 包裹，安装/卸载都靠它定位）
+    return @"
+
+# >>> AssetBridge zbrush adapter >>>
+import sys as _ab_sys, os as _ab_os
+_ab_dir = r'$pluginDir'
+if _ab_os.path.isdir(_ab_dir) and _ab_dir not in _ab_sys.path:
+    _ab_sys.path.insert(0, _ab_dir)
+try:
+    import asset_bridge_zbrush as _ab
+    _ab.autostart()
+except Exception as _ab_e:
+    print('AssetBridge 适配器自动加载失败: %r' % _ab_e)
+# <<< AssetBridge zbrush adapter <<<
+"@
+}
+function Install-ZBrushExtras($app) {
+    # Copy-Plugin 已把插件拷到用户 ZStartup\ZPlugs64\asset_bridge_zbrush。
+    # 这里补两件 ZBrush 特有的事：
+    #   ① 写 ab_config.json（worker 读它拿 server/payload/inbox/outbox，不硬编码）
+    #   ② 往安装目录 ZData\Python\init.py 注入自动加载钩子（幂等；失败不阻塞，
+    #      用户可 ZScript>Python 面板手动 Load Script）
+    $msgs = @()
+    $payload = $script:PayloadDir
+    if (-not $payload) { $payload = (Join-Path $ROOT 'runtime\payload') }
+    foreach ($dst in @($app.targets)) {
+        if (-not (Test-Path $dst)) { continue }
+        $cfgObj = [ordered]@{
+            server_url        = 'http://127.0.0.1:27631'
+            payload_dir       = $payload
+            inbox_dir         = (Join-Path $payload 'zbrush_inbox')
+            outbox_dir        = (Join-Path $payload 'zbrush_outbox')
+            poll_interval     = 2.0
+            default_to        = 'blender'
+            import_settle_sec = 2.0
+            upload_timeout    = 300.0
+        }
+        try {
+            [System.IO.File]::WriteAllText((Join-Path $dst 'ab_config.json'),
+                ($cfgObj | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+            $msgs += "已写配置 -> $dst\ab_config.json"
+        } catch { $msgs += "写配置失败: $_" }
+    }
+    $initPy = ''
+    if ($app.path) { $initPy = Join-Path (Split-Path $app.path) 'ZData\Python\init.py' }
+    $hookDir = ''
+    if (@($app.targets).Count -gt 0) { $hookDir = @($app.targets)[0] }
+    if (-not $initPy -or -not (Test-Path $initPy)) {
+        $msgs += "未找到 $initPy（安装目录结构异常？跳过自动加载注入，可手动 Load Script）"
+    } elseif (-not $hookDir) {
+        $msgs += "无插件目录，跳过 init.py 注入"
+    } else {
+        try {
+            $src = [System.IO.File]::ReadAllText($initPy, [System.Text.Encoding]::UTF8)
+            if ($src -notmatch 'AssetBridge zbrush adapter') {
+                $out = $src.TrimEnd() + "`r`n" + (Get-ZBrushHookBlock $hookDir)
+                [System.IO.File]::WriteAllText($initPy, $out, (New-Object System.Text.UTF8Encoding($false)))
+                $msgs += "已注入自动加载钩子 -> $initPy"
+            } else {
+                $msgs += "init.py 钩子已存在（跳过）"
+            }
+        } catch {
+            $msgs += "注入 init.py 失败（安装目录只读?）: $_ —— 可在 ZScript>Python 面板手动 Load Script"
+        }
+    }
+    return ($msgs -join '  |  ')
+}
+function Uninstall-ZBrushExtras($app) {
+    # 只摘 init.py 钩子；插件目录本体由 Uninstall-App 通用逻辑移 backups
+    $msgs = @()
+    $initPy = ''
+    if ($app.path) { $initPy = Join-Path (Split-Path $app.path) 'ZData\Python\init.py' }
+    if ($initPy -and (Test-Path $initPy)) {
+        try {
+            $src = [System.IO.File]::ReadAllText($initPy, [System.Text.Encoding]::UTF8)
+            if ($src -match 'AssetBridge zbrush adapter') {
+                $out = [regex]::Replace($src,
+                    '(?s)\r?\n?# >>> AssetBridge zbrush adapter >>>.*?# <<< AssetBridge zbrush adapter <<<\r?\n?', '')
+                [System.IO.File]::WriteAllText($initPy, $out.TrimEnd() + "`r`n",
+                    (New-Object System.Text.UTF8Encoding($false)))
+                $msgs += '已移除 init.py 钩子'
+            }
+        } catch { $msgs += "移除 init.py 钩子失败: $_" }
+    }
+    return ($msgs -join '  |  ')
+}
 function Install-App($app) {
     if (-not $app) { return '未检测到该软件（请用下方「指定」按钮手动选择路径）' }
     if ($app.ok -eq $false) { return "无法安装：$($app.note)" }
@@ -1536,11 +1767,19 @@ function Install-App($app) {
     $msgs = @()
     foreach ($dst in $targets) { $msgs += (Copy-Plugin $src $dst $app.name $app) }
     $msg = ($msgs -join '  |  ')
+    if ($app.key -eq 'zbrush') {
+        $extra = Install-ZBrushExtras $app
+        if ($extra) { $msg = ($msg + '  |  ' + $extra) }
+    }
     Log ('安装器: ' + $msg)
     return $msg
 }
 function Uninstall-App($app) {
     if (-not $app) { return '未检测到该软件' }
+    if ($app.key -eq 'zbrush') {
+        $extra = Uninstall-ZBrushExtras $app
+        if ($extra) { Log ('安装器: ' + $extra) }
+    }
     $exist = @()
     if ($app.targets) { $exist = @($app.targets | Where-Object { Test-Path $_ }) }
     if ($exist.Count -eq 0) { return "未安装 $($app.name) 插件，无需卸载" }
@@ -1593,6 +1832,7 @@ function Resolve-ManualApp([string]$key, [string]$path) {
         'toolbag' { $src = 'plugins/toolbag/asset_bridge' }
         'photoshop' { $src = '' }
         'sai2'      { $src = '' }
+        'zbrush'    { $src = 'plugins/zbrush/asset_bridge_zbrush' }
         default   { return $null }
     }
     # 允许直接给安装目录：替他找目录下的可执行文件
@@ -1604,6 +1844,7 @@ function Resolve-ManualApp([string]$key, [string]$path) {
             'toolbag'    { 'toolbag.exe' }
             'photoshop'  { 'Photoshop.exe' }
             'sai2'       { 'sai2.exe' }
+            'zbrush'     { 'ZBrush.exe' }
             default      { '' }
         }
         if ($leaf) {
@@ -1706,6 +1947,31 @@ function Resolve-ManualApp([string]$key, [string]$path) {
                 targets=@((Join-Path (Split-Path $path) 'data\plugin\asset_bridge'))
             }
         }
+        'zbrush' {
+            # 版本从路径（Zbrush2026.2.1）或 exe 文件版本读；targets 指向
+            # 该版本的用户资产目录 ZStartup\ZPlugs64\asset_bridge_zbrush
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                [IO.Path]::GetFileName($path) -ine 'ZBrush.exe') { return $null }
+            $ver = ''
+            if ($path -match 'Z[Bb]rush[ _]?(\d{4}(?:\.\d+)*)') { $ver = $Matches[1] }
+            if (-not $ver) { $ver = Get-ExeVer $path }
+            $ok = ($ver -and (Ver-GE $ver $MIN_ZBRUSH))
+            $note = if ($ok) { '' } else { "版本过低或无法识别（需 >= $MIN_ZBRUSH，Python API 2026.0 起才有）" }
+            $tg = @()
+            if ($ok) {
+                $ud = Get-ZBrushUserDirByVersion $ver
+                if ($ud) {
+                    $tg = @((Join-Path $ud 'ZStartup\ZPlugs64\asset_bridge_zbrush'))
+                } else {
+                    $ok = $false
+                    $note = '未找到该版本的用户资产目录（ZBrush 需至少完整运行过一次）'
+                }
+            }
+            return [PSCustomObject]@{
+                key='zbrush'; name='ZBrush'; version=$ver; path=$path; min=$MIN_ZBRUSH;
+                src=$src; ok=$ok; note=$note; targets=$tg
+            }
+        }
         'photoshop' {
             # 不装插件：只校验 exe 存在，路径随后同步进 editor_daemon.json
             if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
@@ -1791,6 +2057,12 @@ function Request-ManualPath([string]$key) {
             $ofd = New-Object System.Windows.Forms.OpenFileDialog
             $ofd.Filter = 'Marmoset Toolbag|toolbag.exe'
             $ofd.Title  = '选择 toolbag.exe（Toolbag 5）'
+            if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
+        }
+        'zbrush' {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = 'ZBrush|ZBrush.exe'
+            $ofd.Title  = '选择 ZBrush.exe（2026.1+，需完整运行过一次以生成用户目录）'
             if ($ofd.ShowDialog() -eq 'OK') { $path = $ofd.FileName }
         }
         'photoshop' {
@@ -2061,6 +2333,20 @@ $timer.add_Tick({
         Start-Server
     }
     Refresh-State
+    # D3：ZBrush 落盘通知（守护进程写 notify.json -> 气泡展示路径，点击复制，10s 自动消失）
+    try {
+        $nf = Join-Path $EDITOR_STATE 'notify.json'
+        if (Test-Path $nf) {
+            $nj = Get-Content $nf -Raw -Encoding UTF8 | ConvertFrom-Json
+            $script:AbNotifyPath = [string]$nj.path
+            if ($script:AbNotifyPath) {
+                $ni.ShowBalloonTip(10000, 'AssetBridge · ZBrush 接收',
+                    ("模型已就绪，请在 ZBrush 里 Tool:Load 手动加载：`n" + $script:AbNotifyPath +
+                     "`n（点击本气泡复制路径；右键托盘菜单也可复制）"), 'Info')
+            }
+            Remove-Item $nf -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
 })
 
 # 双击托盘图标 -> 状态窗

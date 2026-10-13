@@ -54,8 +54,24 @@ DEFAULT_SERVER = "http://127.0.0.1:27631"
 DEFAULT_APPS = {
     "photoshop": r"D:\DCC\Adobe Photoshop 2023\Photoshop.exe",
     "sai2": r"D:\DCC\[Saier]SAI Ver.2\sai2.exe",
+    "zbrush": r"D:\DCC\Zbrush2026.2.1\ZBrush.exe",
 }
-APP_LABELS = {"photoshop": "Photoshop", "sai2": "SAI2"}
+APP_LABELS = {"photoshop": "Photoshop", "sai2": "SAI2", "zbrush": "ZBrush"}
+
+# ZBrush 专用目录（payload 下）
+ZB_INBOX = "zbrush_inbox"        # 任务文件目录：守护进程写 <tid>.json，ZBrush 适配器消费
+ZB_OUTBOX = "zbrush_outbox"      # 热文件夹：用户手动导出，守护进程自动回传
+ZB_HEARTBEAT = "zb_bridge.heartbeat"   # ZBrush 侧常驻桥接循环写的心跳（判断 worker 存活）
+ZB_NOTIFY = "notify.json"        # D3 托盘提示：ZBrush 运行中且 worker 未接管的落盘通知
+ZB_IMPORT_TIMEOUT_SEC = 300.0    # 任务投递后等回执的上限
+ZB_POPEN_TIMEOUT_SEC = 90.0      # 一次性 -script 拉起后等回执的上限
+ZB_BRIDGE_MAX_AGE = 12.0         # 心跳 freshness 阈值（秒）
+
+# ZBrush 适配器源码位置（一次性 -script 兜底用）
+ZB_ONE_SHOT = REPO_ROOT / "plugins" / "zbrush" / "asset_bridge_zbrush" / "one_shot_import.py"
+
+# 认识的模型扩展名（outbox 只收这些）
+MODEL_EXTS = {".obj", ".ztl", ".stl", ".ply", ".fbx"}
 
 # 认识的图片扩展名（另存为新文件时只收这些；.sai2 等原生格式不收）
 IMAGE_EXTS = {
@@ -127,11 +143,104 @@ def _request(method: str, path: str, body=None, server: str = DEFAULT_SERVER,
     return json.loads(raw.decode("utf-8")) if raw else {}
 
 
+def _put_file(server: str, path: str, file_path: str,
+              timeout: float = 300.0) -> dict:
+    """PUT /transfers/{id}/files/{name}，原始字节上传。"""
+    url = server + API + path
+    with open(file_path, "rb") as fh:
+        data = fh.read()
+    req = urllib.request.Request(
+        url, data=data, method="PUT",
+        headers={"Content-Type": "application/octet-stream"})
+    with _OPENER.open(req, timeout=timeout) as resp:
+        raw = resp.read()
+    return json.loads(raw.decode("utf-8")) if raw else {}
+
+
 def _atomic_write_json(path: Path, obj) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, ensure_ascii=False, indent=2)
     os.replace(str(tmp), str(path))
+
+
+# ---------------------------------------------------------------------------
+# ZBrush 握手（任务文件 + 回执 + 心跳 + 托盘通知）
+# ---------------------------------------------------------------------------
+
+def zb_dirs(payload_dir: str):
+    inbox = os.path.join(payload_dir, ZB_INBOX) if payload_dir else ""
+    outbox = os.path.join(payload_dir, ZB_OUTBOX) if payload_dir else ""
+    hb = os.path.join(payload_dir, ZB_HEARTBEAT) if payload_dir else ""
+    return inbox, outbox, hb
+
+
+def zb_bridge_alive(payload_dir: str, max_age: float = ZB_BRIDGE_MAX_AGE) -> bool:
+    """ZBrush 侧常驻桥接循环是否活着（心跳 freshness）。"""
+    _, _, hb = zb_dirs(payload_dir)
+    if not hb or not os.path.isfile(hb):
+        return False
+    try:
+        return (time.time() - os.stat(hb).st_mtime) <= max_age
+    except OSError:
+        return False
+
+
+def zb_write_task(payload_dir: str, record: dict, files) -> str:
+    """写 <tid>.json 任务文件（ZBrush 适配器扫描消费）。"""
+    inbox, _, _ = zb_dirs(payload_dir)
+    if not inbox:
+        return ""
+    os.makedirs(inbox, exist_ok=True)
+    task = {
+        "transfer_id": record.get("id", ""),
+        "asset_name": record.get("asset_name", ""),
+        "from_app": str((record.get("from") or {}).get("app", "")),
+        "files": [f for f in (files or []) if f],
+        "at": now_iso(),
+    }
+    path = os.path.join(inbox, task["transfer_id"] + ".json")
+    _atomic_write_json(Path(path), task)
+    return path
+
+
+def zb_receipt_path(payload_dir: str, tid: str) -> str:
+    inbox, _, _ = zb_dirs(payload_dir)
+    return os.path.join(inbox, tid + ".done.json") if inbox else ""
+
+
+def zb_take_receipt(payload_dir: str, tid: str):
+    """读回执并消费（删除）。没有则返回 None。"""
+    p = zb_receipt_path(payload_dir, tid)
+    if not p or not os.path.isfile(p):
+        return None
+    try:
+        data = json.loads(Path(p).read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+    return data
+
+
+def zb_write_notify(state_dir: Path, record: dict, files) -> str:
+    """D3：ZBrush 运行中且 worker 未接管 -> 落盘通知托盘（路径+一键复制+自动消失）。"""
+    try:
+        os.makedirs(str(state_dir), exist_ok=True)
+        obj = {
+            "at": now_iso(),
+            "transfer_id": record.get("id", ""),
+            "asset_name": record.get("asset_name", ""),
+            "files": [str(f) for f in (files or [])],
+            "path": str(files[0]) if files else "",
+        }
+        p = state_dir / ZB_NOTIFY
+        _atomic_write_json(p, obj)
+        return str(p)
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +253,7 @@ def load_config(args) -> dict:
         "server": DEFAULT_SERVER,
         "state_dir": Path(DEFAULT_STATE_DIR),
         "apps": dict(DEFAULT_APPS),
+        "zbrush_outbox_to": "blender",
     }
     if CONFIG_FILE.is_file():
         try:
@@ -153,6 +263,8 @@ def load_config(args) -> dict:
             for name, exe in (data.get("apps") or {}).items():
                 if exe:
                     cfg["apps"][str(name)] = str(exe)
+            if str(data.get("zbrush_outbox_to", "")).strip():
+                cfg["zbrush_outbox_to"] = str(data["zbrush_outbox_to"]).strip()
         except Exception as exc:  # 配置文件坏了不影响默认值
             _safe_print("[editor_daemon] 配置文件读取失败，用默认值: {0}".format(exc))
     if args.server:
@@ -163,6 +275,8 @@ def load_config(args) -> dict:
         cfg["apps"]["photoshop"] = args.photoshop
     if args.sai2:
         cfg["apps"]["sai2"] = args.sai2
+    if getattr(args, "zbrush", ""):
+        cfg["apps"]["zbrush"] = args.zbrush
     return cfg
 
 
@@ -287,6 +401,8 @@ class Daemon(object):
         self.started_at = now_iso()
         self.payload_dir = ""           # 由 GET /config 缓存
         self.watches = []
+        self.zb_pending = []            # ZBrush 任务投递等待回执的列表
+        self.zb_returned = 0            # 热文件夹回传计数
         self.handled = 0
         self.returned = 0
         self.last_event = "守护进程启动中"
@@ -422,6 +538,22 @@ class Daemon(object):
             except Exception:
                 pass
         self.watches = []
+        # ZBrush 待回执任务：manual 模式保留任务文件（用户稍后加载），
+        # 其余清理任务文件并取消传输
+        for p in list(self.zb_pending):
+            if p["mode"] != "manual" and p.get("task"):
+                try:
+                    os.remove(p["task"])
+                except OSError:
+                    pass
+            try:
+                self.safe("POST", "/transfers/{0}/finish".format(p["tid"]), {
+                    "status": "cancelled",
+                    "result": {"message": "守护进程停止，ZBrush 任务作废（文件仍在负载目录）"},
+                })
+            except Exception:
+                pass
+        self.zb_pending = []
         self.stopping = True
         if self.own_pidfile:
             try:
@@ -451,6 +583,8 @@ class Daemon(object):
                 self.handle(rec)
 
         self.advance_watches()
+        self._zb_advance_pending()
+        self._zb_process_outbox()
 
     # -- 处理一条新传输 -----------------------------------------------------
     def handle(self, record: dict) -> None:
@@ -459,6 +593,9 @@ class Daemon(object):
         kind = str(record.get("kind", "")).lower()
 
         if app not in self.cfg["apps"]:
+            return
+        if app == "zbrush":
+            self.handle_zbrush(record, kind)
             return
         if kind != "textures":
             self._claim_finish(tid, "error", {
@@ -517,6 +654,189 @@ class Daemon(object):
             APP_LABELS.get(app, app),
             "、".join(os.path.basename(f) for f in files),
             APP_LABELS.get(from_app, from_app)))
+
+    # -- ZBrush：任务文件握手 / 一次性 -script 兜底 / 热文件夹回传 -----------
+    def handle_zbrush(self, record: dict, kind: str) -> None:
+        tid = record.get("id", "")
+        if kind != "models":
+            self._claim_finish(tid, "error", {
+                "message": "ZBrush 只接收模型（kind=models），本次是 {0}".format(
+                    kind or "未标注")})
+            return
+
+        files = list(record.get("_files_abs") or [])
+        if not files:
+            files = [os.path.join(self.payload_dir, tid, f)
+                     for f in (record.get("files") or [])]
+        files = [f for f in files if f and os.path.isfile(f)]
+        if not files:
+            self._claim_finish(tid, "error", {"message": "没有随传输发来的文件"})
+            return
+        frm = record.get("from") or {}
+        from_app = str(frm.get("app", "")).lower()
+        if not from_app:
+            self._claim_finish(tid, "error", {
+                "message": "发送端未标注 from.app，无法回传"})
+            return
+
+        resp = self.safe("POST", "/transfers/{0}/claim".format(tid),
+                         {"session_id": self.session_id})
+        rec = (resp or {}).get("transfer")
+        if not rec:
+            self.log_rl("claim", "claim {0} 失败（可能已被处理）".format(tid))
+            return
+        claim_files = [f for f in (rec.get("_files_abs") or []) if os.path.isfile(f)]
+        if claim_files:
+            files = claim_files
+
+        if not self.payload_dir:
+            self._claim_finish(tid, "error", {
+                "message": "拿不到负载目录，无法投递任务"})
+            return
+
+        # ① ZBrush 侧常驻桥接活着 -> 任务文件握手（不打断用户当前会话）
+        if zb_bridge_alive(self.payload_dir):
+            task = zb_write_task(self.payload_dir, rec, files)
+            if task:
+                self.zb_pending.append({
+                    "tid": tid, "files": files, "mode": "handshake",
+                    "deadline": time.monotonic() + ZB_IMPORT_TIMEOUT_SEC,
+                    "task": task, "from_app": from_app,
+                    "asset_name": rec.get("asset_name", ""),
+                })
+                self.handled += 1
+                self.event("已投递模型任务给 ZBrush 桥接：{0}（等待导入回执）".format(
+                    "、".join(os.path.basename(f) for f in files)))
+                return
+
+        # ② 桥接不在 -> 试一次性 -script 拉起（ZBrush 未运行时才拉得起来）
+        exe = self.cfg["apps"].get("zbrush", "")
+        if exe and os.path.isfile(exe) and ZB_ONE_SHOT.is_file():
+            inbox, _, _ = zb_dirs(self.payload_dir)
+            os.makedirs(inbox, exist_ok=True)
+            try:
+                subprocess.Popen(
+                    [exe, "-script", str(ZB_ONE_SHOT)] + files + [inbox, tid],
+                    close_fds=True)
+                self.zb_pending.append({
+                    "tid": tid, "files": files, "mode": "oneshot",
+                    "deadline": time.monotonic() + ZB_POPEN_TIMEOUT_SEC,
+                    "task": "", "from_app": from_app,
+                    "asset_name": rec.get("asset_name", ""),
+                })
+                self.handled += 1
+                self.event("已用一次性脚本拉起 ZBrush 导入：{0}".format(
+                    "、".join(os.path.basename(f) for f in files)))
+                return
+            except Exception as exc:
+                self.log("一次性拉起 ZBrush 失败: {0!r}".format(exc))
+
+        # ③ 都走不通 -> 落盘 + D3 托盘通知（用户手动 Tool:Load）
+        task = zb_write_task(self.payload_dir, rec, files)
+        zb_write_notify(self.state_dir, rec, files)
+        self.zb_pending.append({
+            "tid": tid, "files": files, "mode": "manual",
+            "deadline": time.monotonic() + ZB_IMPORT_TIMEOUT_SEC,
+            "task": task, "from_app": from_app,
+            "asset_name": rec.get("asset_name", ""),
+        })
+        self.handled += 1
+        self.event("ZBrush 桥接未就绪，模型已落盘：{0}（托盘已提示，"
+                   "可在 ZBrush 里 Tool:Load 手动加载）".format(
+                       "、".join(os.path.basename(f) for f in files)))
+
+    def _zb_advance_pending(self) -> None:
+        now = time.monotonic()
+        for p in list(self.zb_pending):
+            tid = p["tid"]
+            receipt = zb_take_receipt(self.payload_dir, tid)
+            if receipt is not None:
+                status = str(receipt.get("status", "error"))
+                imported = receipt.get("imported") or []
+                if status == "ok":
+                    self._claim_finish(tid, "done", {
+                        "message": "ZBrush 已导入 {0}".format(
+                            "、".join(imported) or "、".join(
+                                os.path.basename(f) for f in p["files"])),
+                    })
+                    self.event("ZBrush 导入完成 {0}".format(tid))
+                else:
+                    self._claim_finish(tid, "error", {
+                        "message": "ZBrush 导入失败: {0}".format(
+                            receipt.get("error") or "未知错误")})
+                self.zb_pending.remove(p)
+                continue
+            if now >= p["deadline"]:
+                # 超时：manual 模式保留任务文件等用户稍后加载；其余清理并取消
+                if p["mode"] != "manual" and p.get("task"):
+                    try:
+                        os.remove(p["task"])
+                    except OSError:
+                        pass
+                if p["mode"] == "oneshot":
+                    # 一次性拉起失败（多半是已有实例挡路）-> 转 manual
+                    task = zb_write_task(self.payload_dir, {
+                        "id": tid, "asset_name": p.get("asset_name", ""),
+                        "from": {"app": p.get("from_app", "")}}, p["files"])
+                    zb_write_notify(self.state_dir, {
+                        "id": tid, "asset_name": p.get("asset_name", "")},
+                        p["files"])
+                    p["mode"] = "manual"
+                    p["task"] = task
+                    p["deadline"] = now + ZB_IMPORT_TIMEOUT_SEC
+                    self.event("ZBrush 一次性导入超时（可能已有实例在运行），"
+                               "已转为落盘 + 托盘提示")
+                    continue
+                self._claim_finish(tid, "cancelled", {
+                    "message": "等待 ZBrush 导入回执超时（文件仍在负载目录，"
+                               "可用 ZBrush 的 Tool:Load 手动加载）"})
+                self.event("ZBrush 任务 {0} 等待超时".format(tid))
+                self.zb_pending.remove(p)
+
+    def _zb_process_outbox(self) -> None:
+        """热文件夹：用户从 ZBrush 手动导出的模型 -> 建传输回传默认目标。"""
+        if not self.payload_dir:
+            return
+        _, outbox, _ = zb_dirs(self.payload_dir)
+        if not outbox or not os.path.isdir(outbox):
+            return
+        to_app = str(self.cfg.get("zbrush_outbox_to", "blender"))
+        now = time.time()
+        for name in sorted(os.listdir(outbox)):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in MODEL_EXTS:
+                continue
+            p = os.path.join(outbox, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if now - st.st_mtime < 2.0:
+                continue
+            body = {
+                "asset_name": os.path.splitext(name)[0],
+                "kind": "models",
+                "format": ext.lstrip("."),
+                "to": {"app": to_app, "project": "", "content_path": ""},
+                "from": {"app": "zbrush", "project": ""},
+                "options": {"editor": "zbrush", "source_file": name,
+                            "hot_folder": True},
+                "note": "ZBrush 热文件夹回传",
+            }
+            try:
+                created = self.safe("POST", "/transfers", body)
+                rtid = (created or {}).get("transfer", {}).get("id", "")
+                if not rtid:
+                    self.log_rl("zbout", "热文件夹建传输失败（{0}）".format(name))
+                    continue
+                _put_file(self.server,
+                          "/transfers/{0}/files/{1}".format(rtid, name), p)
+                self.safe("POST", "/transfers/{0}/publish".format(rtid), {})
+                os.remove(p)
+                self.zb_returned += 1
+                self.event("热文件夹回传 {0} -> {1}（{2}）".format(name, to_app, rtid))
+            except Exception as exc:
+                self.log_rl("zbout", "热文件夹回传失败 {0}: {1!r}".format(name, exc))
 
     def _claim_finish(self, tid: str, status: str, result: dict) -> None:
         self.safe("POST", "/transfers/{0}/claim".format(tid),
@@ -655,6 +975,9 @@ class Daemon(object):
             "apps": {name: {"exe": exe, "ok": os.path.isfile(exe)}
                      for name, exe in self.cfg["apps"].items()},
             "watching": [w.brief() for w in self.watches],
+            "zbrush_pending": len(self.zb_pending),
+            "zbrush_bridge_alive": zb_bridge_alive(self.payload_dir)
+            if self.payload_dir else False,
             "handled": self.handled,
             "returned": self.returned,
             "last_event": self.last_event,
@@ -772,6 +1095,7 @@ def parse_args(argv):
     ap.add_argument("--state-dir", default="", help="状态目录（pid/log/status）")
     ap.add_argument("--photoshop", default="", help="Photoshop.exe 路径")
     ap.add_argument("--sai2", default="", help="sai2.exe 路径")
+    ap.add_argument("--zbrush", default="", help="ZBrush.exe 路径（2026.1+）")
     ap.add_argument("--interval", type=float, default=POLL_INTERVAL_SEC,
                     help="轮询周期（秒）")
     ap.add_argument("--check", action="store_true", help="只打印状态")

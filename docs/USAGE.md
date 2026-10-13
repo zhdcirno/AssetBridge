@@ -1,6 +1,6 @@
 # Asset Bridge 使用文档（面向美术 / 技术美术）
 
-> 适用版本：Blender 5.0.1、Unreal Engine 5.8.3、Maya 2023、Substance 3D Painter、Marmoset Toolbag 5、Photoshop 2023、SAI2（本机实测）  
+> 适用版本：Blender 5.0.1、Unreal Engine 5.8.3、Maya 2023、Substance 3D Painter、Marmoset Toolbag 5、Photoshop 2023、SAI2、**ZBrush 2026.2.1**（本机实测）  
 > 项目根目录：`E:\CirnoWorkSpace\AssetBridge`  
 > 中转服务地址：`http://127.0.0.1:27631`　数据根：`E:\CirnoWorkSpace\AssetBridge\runtime`
 
@@ -42,7 +42,7 @@
 
 | 能力       | 说明                                                                   |
 | -------- | -------------------------------------------------------------------- |
-| 模型收发     | 静态网格（SM\_）/ 骨骼网格（SK\_）在 Blender / UE / Maya / SP / **Toolbag** 间互发 |
+| 模型收发     | 静态网格（SM\_）/ 骨骼网格（SK\_）在 Blender / UE / Maya / SP / **Toolbag** / **ZBrush** 间互发 |
 | 贴图回传     | Substance Painter 画好的 baseColor / normal / ORM 等发回 UE / Blender（kind=textures） |
 | 骨架收发     | FBX 自带骨骼层级，自动随模型过到 UE，不丢朝向                                           |
 | 增量更新     | 重复发送同名资产 = 覆盖更新（revision 递增），**不会**生成 `SM_Chair_1`                   |
@@ -348,6 +348,24 @@ abu.send_selected_assets("blender")
 
 > 停止守护只写 `stop.flag` 让它干净退出，**绝不杀你的 PS / SAI2 进程**。  
 > 想看守护状态：托盘右键菜单里有「编辑器守护：运行中 / 未运行」一行，以及「启动/停止编辑器守护」两项。
+
+### 3.7 ZBrush 2026.1+（模型收发）
+
+> 需要 **ZBrush 2026.1 或更高**（Python API 是 2026.0 才有的；2025.x 只有 ZScript，用不了）。
+> 2026.1 起 ZBrush 安装目录只读，插件装在**用户资产目录**（`%APPDATA%\Maxon\Zbrush<版本>_<哈希>\ZStartup\ZPlugs64\`）。
+
+**安装**：托盘 → 安装插件 → ZBrush 行点 **安装**。安装器会做三件事：拷插件到用户 ZStartup、写运行配置、往 `ZData\Python\init.py` 注入自动加载钩子。**重启 ZBrush** 后自动出现 `Zplugin → AssetBridge` 面板，桥接自动开始运行（左上角 note bar 有提示）。
+（万一 init.py 注入失败：ZScript 面板 → Python 子面板 → Load Script，选用户 ZStartup\ZPlugs64\asset_bridge_zbrush\asset_bridge_zbrush.py，效果一样。）
+
+**接收模型（其他软件 → ZBrush）——全自动**：在 Blender / Maya / UE / SP / Toolbag 里把模型发往 **ZBrush**。ZBrush 桥接在运行时自动导入（免对话框）。
+特殊情况：ZBrush 开着但桥接没启动（比如刚 Load 完脚本）时，模型会先落盘，托盘弹气泡告诉你文件路径（点气泡复制路径，或右键托盘「复制最近一次 ZBrush 接收路径」），然后在 ZBrush 里 `Tool → Load` 手动加载即可。
+
+**发送模型（ZBrush → 其他软件）——手动触发**：ZBrush 里选中要发的工具（SubTool），点 `Zplugin → AssetBridge → 发送当前模型`（默认发往 Blender；想发回最近一次给你发模型的软件，点「发送回最近发送者」）。导出免对话框，发完 note bar 有提示，对方软件自动导入/重载。
+
+**热文件夹兜底**：不想用按钮，也可以在 ZBrush 里手动导出 OBJ 到 `<中转目录>\zbrush_outbox\`，编辑器守护会自动把它回传给 Blender（目标可在 `tools\editor_daemon.json` 的 `zbrush_outbox_to` 改）。
+
+> ⚠️ ZBrush **没有「保存后自动回传」**（没有保存事件钩子），发送一律是手动触发——按钮或热文件夹，二选一。
+> ⚠️ 高模先 Decimation 再发，OBJ 动辄几百 MB。
 
 ---
 
