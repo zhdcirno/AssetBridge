@@ -397,31 +397,66 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    # 客户端中途断连（WinError 10053 ConnectionAbortedError / 10054
+    # ConnectionResetError / BrokenPipeError，都是 ConnectionError 子类）：
+    # 探活客户端超时关连接是常态，不能当 500 抛栈刷 server_console.log
+    def _client_gone(self, what: str, exc: Exception) -> None:
+        if os.environ.get("BRIDGE_VERBOSE"):
+            sys.stderr.write("[bridge] %s client disconnected (%s): %s\n"
+                             % (self.address_string(), what, exc))
+
     def do_GET(self) -> None:
         try:
             self._route_get()
+        except ConnectionError as exc:
+            self._client_gone("GET", exc)
         except Exception as exc:
-            self._err(500, f"{type(exc).__name__}: {exc}")
+            try:
+                self._err(500, f"{type(exc).__name__}: {exc}")
+            except ConnectionError:
+                self._client_gone("GET/500", exc)
 
     def do_POST(self) -> None:
         try:
             self._route_post()
+        except ConnectionError as exc:
+            self._client_gone("POST", exc)
         except ValueError as exc:
-            self._err(400, str(exc))
+            try:
+                self._err(400, str(exc))
+            except ConnectionError:
+                self._client_gone("POST/400", exc)
         except KeyError as exc:
-            self._err(404, f"not found: {exc}")
+            try:
+                self._err(404, f"not found: {exc}")
+            except ConnectionError:
+                self._client_gone("POST/404", exc)
         except Exception as exc:
-            self._err(500, f"{type(exc).__name__}: {exc}")
+            try:
+                self._err(500, f"{type(exc).__name__}: {exc}")
+            except ConnectionError:
+                self._client_gone("POST/500", exc)
 
     def do_PUT(self) -> None:
         try:
             self._route_put()
+        except ConnectionError as exc:
+            self._client_gone("PUT", exc)
         except ValueError as exc:
-            self._err(400, str(exc))
+            try:
+                self._err(400, str(exc))
+            except ConnectionError:
+                self._client_gone("PUT/400", exc)
         except KeyError as exc:
-            self._err(404, f"not found: {exc}")
+            try:
+                self._err(404, f"not found: {exc}")
+            except ConnectionError:
+                self._client_gone("PUT/404", exc)
         except Exception as exc:
-            self._err(500, f"{type(exc).__name__}: {exc}")
+            try:
+                self._err(500, f"{type(exc).__name__}: {exc}")
+            except ConnectionError:
+                self._client_gone("PUT/500", exc)
 
     # -- GET
     def _route_get(self) -> None:
