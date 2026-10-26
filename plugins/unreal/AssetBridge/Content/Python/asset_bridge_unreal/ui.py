@@ -27,6 +27,7 @@ _CMD_SEND_TOOLBAG_BAKE = ("import asset_bridge_unreal; "
                           "asset_bridge_unreal.send_selected_assets('toolbag', mode='bake')")
 _CMD_SEND_TOOLBAG_RENDER = ("import asset_bridge_unreal; "
                             "asset_bridge_unreal.send_selected_assets('toolbag', mode='render')")
+_CMD_SEND_ZBRUSH = "import asset_bridge_unreal; asset_bridge_unreal.send_selected_assets('zbrush')"
 _CMD_SEND_TEX_PS = ("import asset_bridge_unreal; "
                     "asset_bridge_unreal.send_selected_textures('photoshop')")
 _CMD_SEND_TEX_SAI = ("import asset_bridge_unreal; "
@@ -132,6 +133,10 @@ def _populate_actions(menu, prefix):
     menu.add_menu_entry("Send", _py_entry(
         prefix + "_ToolbagRender", "发送选中 -> Toolbag（渲染）", _CMD_SEND_TOOLBAG_RENDER,
         "只把模型/材质导入 Toolbag，用于渲染"))
+    menu.add_menu_entry("Send", _py_entry(
+        prefix + "_ZBrush", "发送选中 -> ZBrush", _CMD_SEND_ZBRUSH,
+        "把内容浏览器里选中的 StaticMesh 导出 OBJ 推送到 ZBrush"
+        "（OBJ 只对静态网格有效，其它类型自动跳过）"))
     # 贴图子菜单：只发 Texture2D，保存后自动覆盖原资产
     tex_sub = menu.add_sub_menu(menu.get_name(), "AssetBridge",
                                 prefix + "TexSub", "发送贴图到编辑器")
@@ -304,6 +309,7 @@ def _register_content_browser(menus):
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_SP", "Substance Painter", _CMD_SEND_SP))
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_ToolbagBake", "Toolbag（烘焙）", _CMD_SEND_TOOLBAG_BAKE))
     send_sub.add_menu_entry("Send", _py_entry("AB_CB_ToolbagRender", "Toolbag（渲染）", _CMD_SEND_TOOLBAG_RENDER))
+    send_sub.add_menu_entry("Send", _py_entry("AB_CB_ZBrush", "ZBrush", _CMD_SEND_ZBRUSH))
     tex_sub = cb.add_sub_menu(cb.get_name(), "AssetBridge", "ABTexSub", "发送贴图到编辑器")
     if tex_sub is not None:
         tex_sub.add_menu_entry("Send", _py_entry("AB_CB_TexPS", "Photoshop", _CMD_SEND_TEX_PS))

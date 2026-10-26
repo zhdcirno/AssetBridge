@@ -38,8 +38,17 @@ def selected_asset_paths() -> List[str]:
     return out
 
 
-def export_assets(asset_paths: List[str], out_dir: str, profile: Dict) -> List[str]:
-    """导出为 FBX，返回写出的文件绝对路径。"""
+def export_assets(asset_paths: List[str], out_dir: str, profile: Dict,
+                  fmt: str = "fbx") -> List[str]:
+    """导出资产，返回写出的文件绝对路径。
+
+    fmt="fbx"：走 FBX（默认，支持 StaticMesh/SkeletalMesh/动画等）。
+    fmt="obj"：走引擎内置 UStaticMeshExporterOBJ（RunAssetExportTask 按
+              文件扩展名自动选导出器，引擎源码 EditorExporters.cpp 已注册
+              SupportedClass=StaticMesh / FormatExtension=OBJ）。
+              OBJ 只对 StaticMesh 有效 —— 其它类型资产会跳过并打 warning
+              （ZBrush 第一期只收静态网格模型）。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -53,18 +62,13 @@ def export_assets(asset_paths: List[str], out_dir: str, profile: Dict) -> List[s
         if not asset:
             unreal.log_warning(f"[bridge] 资产不存在: {p}")
             continue
+        if fmt == "obj" and not isinstance(asset, unreal.StaticMesh):
+            unreal.log_warning(
+                f"[bridge] OBJ 导出只支持 StaticMesh，跳过: {p}"
+                f"（{type(asset).__name__}）")
+            continue
         name = Path(p).name
-        fp = out_dir / f"{name}.fbx"
-
-        opts = unreal.FbxExportOption()
-        _safe_set(opts, "ascii", bool(exp_opts.get("ascii", False)))
-        _safe_set(opts, "collision", False)
-        _safe_set(opts, "export_morph_targets", True)
-        # 下面两个在 UE 5.8 已移除，留着是为了兼容旧版本；缺失时 _safe_set 会跳过
-        _safe_set(opts, "export_materials", True)
-        _safe_set(opts, "export_texture", True)
-        _safe_set(opts, "vertex_color", True)
-        _safe_set(opts, "level_of_detail", False)
+        fp = out_dir / f"{name}.{fmt}"
 
         task = unreal.AssetExportTask()
         task.set_editor_property("object", asset)
@@ -73,7 +77,18 @@ def export_assets(asset_paths: List[str], out_dir: str, profile: Dict) -> List[s
         task.set_editor_property("prompt", False)
         task.set_editor_property("replace_identical", True)
         task.set_editor_property("write_empty_files", False)
-        task.set_editor_property("options", opts)
+        if fmt == "fbx":
+            opts = unreal.FbxExportOption()
+            _safe_set(opts, "ascii", bool(exp_opts.get("ascii", False)))
+            _safe_set(opts, "collision", False)
+            _safe_set(opts, "export_morph_targets", True)
+            # 下面两个在 UE 5.8 已移除，留着是为了兼容旧版本；缺失时 _safe_set 会跳过
+            _safe_set(opts, "export_materials", True)
+            _safe_set(opts, "export_texture", True)
+            _safe_set(opts, "vertex_color", True)
+            _safe_set(opts, "level_of_detail", False)
+            task.set_editor_property("options", opts)
+        # OBJ 不传 options：FbxExportOption 与 OBJ 导出器的选项类不匹配
 
         tasks.append(task)
         written.append(str(fp))

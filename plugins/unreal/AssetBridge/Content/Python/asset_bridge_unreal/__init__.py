@@ -21,6 +21,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -229,7 +230,25 @@ def _handle(record: dict) -> None:
             opts = record.get("options") or {}
             if opts.get("return_of"):
                 # PS / SAI2 保存回传：覆盖原 Texture2D 资产（引用不丢）
+                # 诊断（2026-10-13 夜）：回传映射三要素——守护带回的 source_files /
+                # 发送时记录的 asset_paths / 实际到达的文件名，三者对得上才重载得动
+                unreal.log("[bridge] return_of={0} source_files={1} asset_paths={2} "
+                           "arrived={3}".format(
+                               opts.get("return_of"), opts.get("source_files"),
+                               opts.get("asset_paths"),
+                               [Path(f).name for f in files]))
+                # 分段计时（2026-10-14）：回传传输 published_at -> UE 重载完成。
+                # 配合 daemon 的 [timing] 行可算全链各段占比
+                _t0 = time.time()
                 paths = importer.reload_textures(record, files, opts)
+                pub = record.get("published_at") or record.get("created_at") or ""
+                try:
+                    _gap = _t0 - datetime.fromisoformat(
+                        str(pub).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    _gap = -1.0
+                unreal.log(f"[bridge][timing] published->reload {_gap:.1f}s "
+                           f"({len(paths)} assets, rt={str(opts.get('return_of'))[:8]})")
                 result = {"assets": paths, "message": f"保存后重载 {len(paths)} 张贴图"}
             else:
                 paths = importer.import_textures(record, files)
@@ -354,12 +373,17 @@ def send_selected_assets(target_app: str = "blender", note: str = "",
     raw_name = Path(paths[0]).name
     asset_name = _to_ascii(raw_name) if _to_ascii else raw_name
 
+    # ZBrush 免对话框导入只认 OBJ -> 目标为 zbrush 时强制 OBJ 导出
+    # （引擎按扩展名选 UStaticMeshExporterOBJ，只导 StaticMesh，其余类型跳过）
+    to_zbrush = (target_app == "zbrush")
+    fmt = "obj" if to_zbrush else "fbx"
+
     # 游戏线程：仅本地导出（不产生网络 IO，不卡 UI）
     import tempfile
     import shutil
     work_dir = tempfile.mkdtemp(prefix="ab_send_")
     try:
-        files = exporter.export_assets(paths, work_dir, {})
+        files = exporter.export_assets(paths, work_dir, {}, fmt=fmt)
     except Exception as exc:
         unreal.log_error(f"[bridge] 导出失败: {exc}")
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -371,8 +395,8 @@ def send_selected_assets(target_app: str = "blender", note: str = "",
 
     meta = {
         "asset_name": asset_name,
-        "kind": "static_mesh",
-        "format": "fbx",
+        "kind": "models" if to_zbrush else "static_mesh",
+        "format": fmt,
         "to": {"app": target_app, "project": CONFIG["project"], "content_path": ""},
         "unit": {"scene_unit": "cm", "up_axis": "Z", "forward_axis": "X", "unit_scale": 1.0},
         "options": {"mode": mode},
@@ -391,6 +415,9 @@ def send_selected_assets(target_app: str = "blender", note: str = "",
 def _send_bg(target_app: str, meta: dict, files: list, work_dir: str) -> None:
     """后台线程：建 transfer + 落盘中转目录或上传 + publish。不碰任何 UE 资产 API。"""
     import shutil
+    global _SEND_T0
+    _t_start = _SEND_T0          # 贴图发送入口打的时间戳（0=没打，用当前时间）
+    _SEND_T0 = 0.0               # 消费即清，避免下一次发送误用
     c = client()
     try:
         rec = c.create_transfer(meta)
@@ -409,6 +436,10 @@ def _send_bg(target_app: str, meta: dict, files: list, work_dir: str) -> None:
                 c.put_file(tid, f)
         rec = c.publish(tid)
         unreal.log(f"[bridge] ✓ 已发送 {len(files)} 个资产 -> {target_app} (rev {rec['revision']})")
+        # 分段计时（2026-10-14）：UE 发 -> server 收（建传输+上传+publish 全链）
+        if _t_start:
+            unreal.log(f"[bridge][timing] send->server {time.time() - _t_start:.1f}s "
+                       f"({len(files)} 个文件 -> {target_app}, tid={tid[:8]})")
     except Exception as exc:
         unreal.log_error(f"[bridge] ✗ 发送失败: {type(exc).__name__}: {exc}")
     finally:
@@ -469,7 +500,14 @@ def send_selected_textures(target_app: str = "photoshop", note: str = "") -> int
         args=(target_app, meta, files, work_dir), daemon=True
     ).start()
     unreal.log(f"[bridge] 正在后台推送 {len(files)} 张贴图 -> {target_app} …")
+    # 分段计时（2026-10-14）：发送端起点打戳，_send_bg 收到 publish
+    # 应答后打终点，差值即「UE 发 -> server 收」段耗时（SAI2 回传慢定位）
+    global _SEND_T0
+    _SEND_T0 = time.time()
     return len(files)
+
+
+_SEND_T0 = 0.0
 
 
 def import_local_groom(abc_path: str, asset_name: str = "", content_path: str = "/Game/Bridge/Groom") -> Dict:

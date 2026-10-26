@@ -6,6 +6,7 @@ UE 侧导入。
 automated=True 表示不弹导入对话框，replace_existing=True 表示覆盖同名资产，
 这两条是实现「一键发送 + 自动导入」和「增量更新同名资产」的关键。
 """
+from pathlib import Path
 from typing import Dict, List
 
 import unreal
@@ -126,7 +127,12 @@ def import_model(record: dict, fbx_path: str, profile: Dict) -> Dict:
     task.set_editor_property("replace_existing", True)
     task.set_editor_property("automated", True)   # 不弹窗
     task.set_editor_property("save", True)
-    task.set_editor_property("options", _build_import_ui(record, profile))
+    if str(fbx_path).lower().endswith(".obj"):
+        # OBJ 走 Interchange（FBX SDK 兼容读取 .obj），不消费 FbxImportUI ——
+        # 传错选项类可能导致导入失败，干脆交给 Interchange 默认管线
+        pass
+    else:
+        task.set_editor_property("options", _build_import_ui(record, profile))
 
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
     return classify_imported(task.get_editor_property("imported_object_paths") or [])
@@ -375,7 +381,9 @@ def reload_textures(record: dict, file_paths: List[str], opts: dict) -> List[str
             if 0 <= idx < len(asset_paths):
                 target = asset_paths[idx]
         if target:
-            dest_path = str(Path(target).parent)
+            # as_posix：Windows 下 str(Path) 会产出 \Game\... 反斜杠包路径，
+            # UE 的 destination_path 统一用 /Game/... 正斜杠
+            dest_path = Path(target).parent.as_posix()
             dest_name = Path(target).name
         else:
             dest_path = default_dir
