@@ -354,6 +354,30 @@ def import_fbx(path, profile, material_names=None):
     return sorted(after - before)
 
 
+def import_obj(path):
+    """导入 OBJ（ZBrush 发来的模型都是 OBJ；走 FBX 导入器会直接报错）。
+
+    依赖 Maya 自带 objExport 插件（同时注册 OBJ 导入翻译器）。
+    """
+    try:
+        if not cmds.pluginInfo("objExport", query=True, loaded=True):
+            cmds.loadPlugin("objExport", quiet=True)
+    except Exception:
+        pass
+    before = set(cmds.ls(assemblies=True) or [])
+    # OBJ 导入翻译器名在版本间可能是 "OBJ" / "OBJimport"，逐个尝试
+    last_exc = None
+    for typ in ("OBJ", "OBJimport"):
+        try:
+            cmds.file(path, i=True, type=typ, returnNewNodes=True,
+                      options="groups=1;ptgroups=1;materials=0;smoothing=1;normals=1")
+            after = set(cmds.ls(assemblies=True) or [])
+            return sorted(after - before)
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError("OBJ 导入失败: {0}".format(last_exc))
+
+
 # 要清掉的材质节点类型（覆盖 Maya 内置 + Arnold）。只删这些，绝不碰 mesh 等。
 _MATERIAL_NODE_TYPES = (
     "lambert", "blinn", "phong", "phongE", "anisotropic",
@@ -566,6 +590,27 @@ def export_selection(path, profile):
     return path if os.path.exists(path) else None
 
 
+def export_selection_obj(path):
+    """导出当前选择为 OBJ（ZBrush 目标专用：ZBrush 免对话框导入只认 OBJ）。
+
+    依赖 Maya 自带 objExport 插件（2023 内置，按需加载）。
+    返回路径；失败返回 None。
+    """
+    try:
+        if not cmds.pluginInfo("objExport", query=True, loaded=True):
+            cmds.loadPlugin("objExport", quiet=True)
+    except Exception:
+        pass  # 已加载时 pluginInfo 也可能抛异常，继续尝试导出
+    try:
+        cmds.file(path, force=True,
+                  options="groups=1;ptgroups=1;materials=0;smoothing=1;normals=1",
+                  typ="OBJexport", es=True, pr=True)
+    except Exception as exc:
+        cmds.warning("[bridge] OBJ 导出失败: {0}".format(exc))
+        return None
+    return path if os.path.exists(path) else None
+
+
 # ---------------------------------------------------------------------------
 # 收发
 # ---------------------------------------------------------------------------
@@ -584,12 +629,14 @@ def send_selection(target_app="unreal", note="", mode="update"):
     else:
         name = "".join(c if (c.isalnum() or c in "_-") else "_" for c in name)
 
+    to_zbrush = (target_app == "zbrush")
+    ext = "obj" if to_zbrush else "fbx"
     meta = {
         "asset_name": name,
-        "kind": "skeletal_mesh" if any(
+        "kind": "models" if to_zbrush else ("skeletal_mesh" if any(
             cmds.nodeType(s) == "joint" or cmds.listRelatives(s, type="joint")
-            for s in sel) else "static_mesh",
-        "format": "fbx",
+            for s in sel) else "static_mesh"),
+        "format": ext,
         "to": {"app": target_app, "project": CONFIG["project"], "content_path": "/Game/Bridge"},
         "unit": {"scene_unit": "cm", "up_axis": "Y", "forward_axis": "Z", "unit_scale": 1.0},
         # Toolbag 目标时 mode = bake/render（Toolbag 适配器据此分流）；
@@ -603,21 +650,26 @@ def send_selection(target_app="unreal", note="", mode="update"):
     # 服务端可能把中文名归一化成了拼音，以它为准，保证文件名与记录名一致
     name = rec.get("asset_name") or name
 
+    def _export_model(out_path):
+        if to_zbrush:
+            return export_selection_obj(out_path)
+        return export_selection(out_path, route_profile("maya"))
+
     pd = payload_dir()
     if pd:
         out = os.path.join(pd, tid)
         if not os.path.isdir(out):
             os.makedirs(out)
-        fbx = export_selection(os.path.join(out, name + ".fbx"), route_profile("maya"))
+        fbx = _export_model(os.path.join(out, "{0}.{1}".format(name, ext)))
         if not fbx:
-            raise BridgeError("FBX 导出失败，检查 Script Editor")
+            raise BridgeError("模型导出失败，检查 Script Editor")
     else:
         # py2.7 没有 tempfile.TemporaryDirectory，用 mkdtemp + rmtree 代替
         tmp = tempfile.mkdtemp(prefix="ab_")
         try:
-            fbx = export_selection(os.path.join(tmp, name + ".fbx"), route_profile("maya"))
+            fbx = _export_model(os.path.join(tmp, "{0}.{1}".format(name, ext)))
             if not fbx:
-                raise BridgeError("FBX 导出失败，检查 Script Editor")
+                raise BridgeError("模型导出失败，检查 Script Editor")
             with open(fbx, "rb") as fh:
                 blob = fh.read()
             _req("PUT", "/transfers/{0}/files/{1}".format(tid, os.path.basename(fbx)),
@@ -828,7 +880,11 @@ def _handle(record):
             for _m in (_o.get("materials") or []):
                 if _m and _m not in mat_names:
                     mat_names.append(_m)
-        new = import_fbx(fbx[0], route_profile(src), material_names=mat_names)
+        # ZBrush 发来的都是 OBJ；按扩展名选导入器
+        if fbx[0].lower().endswith(".obj"):
+            new = import_obj(fbx[0])
+        else:
+            new = import_fbx(fbx[0], route_profile(src), material_names=mat_names)
         cmds.warning("[bridge] 收到 {0} (rev {1})".format(
             record["asset_name"], record["revision"]))
         _report(record["id"], "done",
@@ -1308,7 +1364,7 @@ def show_panel():
                     marginWidth=6, marginHeight=6)
     tgt = cmds.optionMenu("abTargetMenu", label="目标软件")
     for _app in ("unreal", "blender", "substance_painter", "maya",
-                 "toolbag", "photoshop", "sai2"):
+                 "toolbag", "photoshop", "sai2", "zbrush"):
         cmds.menuItem(label=_app)
     # Toolbag 模式（仅目标为 toolbag 时生效）：烘焙=建烘焙组+烘焙回传SP；渲染=只导入
     cmds.optionMenu("abToolbagModeMenu", label="Toolbag 模式")
