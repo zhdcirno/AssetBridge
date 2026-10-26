@@ -45,6 +45,8 @@ $LOG       = Join-Path $LOGDIR 'tray.log'
 $SRVLOG    = Join-Path $LOGDIR 'server_console.log'
 $CONFIG    = Join-Path $ScriptDir 'tray_config.json'
 $LOCKFILE  = Join-Path $LOGDIR 'tray.lock'
+$FLOWCFG   = Join-Path $RUNTIME 'flow_settings.json'   # 流转设置：逐路由 auto_open/auto_focus/format 覆盖
+$PROFILES  = Join-Path $ROOT 'shared\profiles.json'     # 路由表 + 各 App 支持格式（流转设置只读此源）
 $ICONSRC   = Join-Path $ROOT 'assets\icons\png\16'   # 状态窗按钮用的小图标（16px）
 $APPICON   = Join-Path $ROOT 'assets\icons\ico\app_logo.ico'
 
@@ -117,6 +119,21 @@ function Flush-Log {
     }
 }
 
+# UI 日志框过滤：内部轮询/心跳/回调整噪声不进界面（仍落 tray.log 供排障）。
+# 用户点击等"业务事件"保留，便于在状态窗看到自己刚才的操作结果。
+$script:LogNoise = @('refresh-state called', 'callback ok=', 'task dispatched timeout')
+function Format-LogForUI($lines) {
+    $out = @()
+    foreach ($l in $lines) {
+        $skip = $false
+        foreach ($n in $script:LogNoise) {
+            if ($l -match [regex]::Escape($n)) { $skip = $true; break }
+        }
+        if (-not $skip) { $out += $l }
+    }
+    return $out
+}
+
 function Get-AbImage([string]$file, [string]$src = $ICONSRC) {
     # 状态窗按钮上的小图标。读不到就返回 $null（按钮不显示图标，不影响功能）。
     # $src 默认 $ICONSRC（assets\icons\png\16）；安装器行内 20px 图标传 tray\icons。
@@ -138,11 +155,12 @@ function Get-AbImage([string]$file, [string]$src = $ICONSRC) {
     return $null
 }
 
-function New-AbButton($parent, [string]$text, [string]$icon, [int]$x, [int]$w) {
-    # 带图标的状态窗按钮（图标放左侧、文字靠右）
+function New-AbButton($parent, [string]$text, [string]$icon, [int]$x, [int]$w, [int]$y = 274) {
+    # 带图标的状态窗按钮（图标放左侧、文字靠右）。
+    # 新增可选 $y：默认 274 保持旧调用不变（仅主面板状态窗底部一排按钮用得到）。
     $b = New-Object System.Windows.Forms.Button
     $b.Text = $text
-    $b.SetBounds($x, 274, $w, 32)
+    $b.SetBounds($x, $y, $w, 32)
     $img = Get-AbImage $icon
     if ($img -ne $null) {
         $b.Image      = $img
@@ -216,6 +234,7 @@ function Exit-Tray {
 $script:Port     = 27631
 $script:Interval = 10
 $script:Guard    = $true
+$script:ManualStop = $false   # 用户手动停止标志：置位期间守护不自动拉起（2026-10-13 夜：点停止被 Guard 覆盖）
 $script:LastUp   = $false
 $script:PayloadDir = ''    # 中转文件路径（负载目录），自动从服务端 /api/v1/config 取
 $script:AbNotifyPath = ''  # D3：最近一次 ZBrush 接收的文件路径（气泡点击/菜单复制用）
@@ -248,7 +267,7 @@ function Get-WorkerSliceText {
         # job 无文件环境里 $MyInvocation.MyCommand.Definition 是「job 脚本块全文」而非
         # 路径，Split-Path/Join-Path 推导必然产出垃圾或直接报错；全部常量由 $consts 在
         # IEX 之前注入当前 scope。正则区分大小写，避免误杀函数内小写局部变量。
-        $constRe = '(?-i)^\s*\$(ScriptDir|ROOT|PYTHON|PYTHONW|SERVER|RUNSERVER|RUNTIME|EDITOR_DAEMON|EDITOR_CFG|EDITOR_STATE|LOGDIR|LOG|SRVLOG|CONFIG|LOCKFILE|ICONSRC|APPICON|ICON_OK|ICON_DOWN|ICON_WARN|ICON_PAUSED)\s*='
+        $constRe = '(?-i)^\s*\$(ScriptDir|ROOT|PYTHON|PYTHONW|SERVER|RUNSERVER|RUNTIME|EDITOR_DAEMON|EDITOR_CFG|EDITOR_STATE|LOGDIR|LOG|SRVLOG|CONFIG|LOCKFILE|ICONSRC|APPICON|ICON_OK|ICON_DOWN|ICON_WARN|ICON_PAUSED|ManualStop)\s*='
         if ($cut -gt 0) {
             $headLines = @(($src.Substring(0, $cut) -split "`r?`n") | Where-Object { $_ -notmatch $constRe })
             [void]$sb.Append(($headLines -join "`n"))
@@ -297,6 +316,7 @@ function Start-BgTask([string]$tag, [scriptblock]$work, [scriptblock]$onDone,
         SRVLOG = $SRVLOG; CONFIG = $CONFIG; LOCKFILE = $LOCKFILE
         EDITOR_DAEMON = $EDITOR_DAEMON; EDITOR_CFG = $EDITOR_CFG; EDITOR_STATE = $EDITOR_STATE
         ICONSRC = $ICONSRC; APPICON = $APPICON
+        MANUAL_STOP = $script:ManualStop
         ICON_OK = $ICON_OK; ICON_DOWN = $ICON_DOWN; ICON_WARN = $ICON_WARN; ICON_PAUSED = $ICON_PAUSED
         SERVER = $SERVER
     }
@@ -665,19 +685,20 @@ function Stop-EditorDaemon {
     }
 }
 function Get-EditorDaemonStatusText {
-    # 菜单 / 状态窗共用的一句话状态
+    # 菜单 / 状态窗共用的一句话状态（精简：行头已由「② 编辑器守护」标注，这里只给状态本身，
+    # 避免整行过长在窄标签里被裁成「行」字）
     $p = Get-EditorDaemonPid
-    if ($p -le 0) { return '编辑器守护：未运行' }
+    if ($p -le 0) { return '未运行' }
     $extra = ''
     $sf = Join-Path $EDITOR_STATE 'status.json'
     if (Test-Path $sf) {
         try {
             $st = Get-Content $sf -Raw -Encoding UTF8 | ConvertFrom-Json
             $w = @($st.watching).Count
-            if ($w -gt 0) { $extra = ('，监听中 {0} 个文件' -f $w) }
+            if ($w -gt 0) { $extra = (' · 监听 {0} 个文件' -f $w) }
         } catch { }
     }
-    return ('编辑器守护：运行中 pid={0}{1}' -f $p, $extra)
+    return ('运行中 · PID {0}{1}' -f $p, $extra)
 }
 
 # ---- 界面 -----------------------------------------------------------------
@@ -726,16 +747,28 @@ function Apply-Icon([string]$state) {
 
 $script:StatusLabel = $null
 $script:LogBox      = $null
+$script:LastUiPaint = [DateTime]::MinValue   # UI 日志框 1Hz 限频：记录上次重绘时间
+# 2026-10-19：流转设置缓存 + 控件引用（脚本作用域，供后台回调跨线程回填）。
+# 缓存命中（30s 内）则打开面板秒开，不再同步读 profiles.json 卡 UI。
+$script:FlowSettingsCache     = $null
+$script:FlowSettingsCacheAt   = 0
+$script:FlowRowCtrls          = $null
+$script:FlowPanel             = $null
+$script:FlowPlaceholder       = $null
+$script:InstallerCache    = $null            # 安装器检测缓存：弹窗先渲染旧数据，避免全量扫盘卡界面
+$script:InstallerScanTimer = $null          # 一次性延时定时器（弹窗绘制后再触发后台扫描）
 
 function Get-StateData {
     # 后台线程调用：只做探测与守护自愈，不碰任何 UI 对象。
     # 依赖的 $script:Guard / $script:Port 由调用方通过 workArgs 注入（runspace 不共享变量）。
     $up = Test-Server
-    if (-not $up -and $script:Guard) {
+    if (-not $up -and $script:Guard -and -not $script:ManualStop) {
         Log '检测到服务未运行 -> 自动拉起'
         Start-Server
         Start-Sleep -Milliseconds 400
         $up = Test-Server
+    } elseif (-not $up -and $script:ManualStop) {
+        Log '服务未运行（用户手动停止，守护不拉起）'
     }
     $srvPid = 0
     if ($up) { try { $srvPid = Get-ServerPid } catch { } }
@@ -755,7 +788,7 @@ function Refresh-State($data) {
     if ($script:LastUp) {
         if ($script:Guard) { $state = 'ok' } else { $state = 'paused' }
     } else {
-        if ($script:Guard) { $state = 'warn' } else { $state = 'down' }
+        if ($script:Guard -and -not $script:ManualStop) { $state = 'warn' } else { $state = 'down' }
     }
     Apply-Icon $state
 
@@ -767,7 +800,7 @@ function Refresh-State($data) {
             $ni.Text = ('AssetBridge 运行中(守护已暂停) :{0}' -f $script:Port)
         }
     } else {
-        if ($script:Guard) {
+        if ($script:Guard -and -not $script:ManualStop) {
             $ni.Text = ('AssetBridge 已停止 :{0} (等待自动拉起)' -f $script:Port)
         } else {
             $ni.Text = ('AssetBridge 已停止 :{0}' -f $script:Port)
@@ -797,11 +830,20 @@ function Update-StatusWindow {
     }
     if ($script:LogBox -ne $null) {
         try {
-            if (Test-Path $LOG) {
-                $tail = Get-Content $LOG -Tail 14 -Encoding utf8
-                $script:LogBox.Lines = $tail
-                $script:LogBox.SelectionStart = $script:LogBox.Text.Length
-                $script:LogBox.ScrollToCaret()
+            $now = [DateTime]::Now
+            # 1Hz 限频：日志框重绘最多每秒一次，避免高频刷新拖慢主线程（Bug 3 性能红线）。
+            # 状态条/编辑器守护状态不在限频内（开销极低），仍随每次 Refresh-State 即时更新。
+            if (($now - $script:LastUiPaint).TotalMilliseconds -ge 1000) {
+                $script:LastUiPaint = $now
+                if (Test-Path $LOG) {
+                    # 多读一些再过滤：保证过滤掉轮询噪声后仍有足够业务日志可见
+                    $raw  = Get-Content $LOG -Tail 200 -Encoding utf8
+                    $filt = Format-LogForUI $raw
+                    $tail = if ($filt.Count -gt 14) { $filt[($filt.Count - 14)..($filt.Count - 1)] } else { $filt }
+                    $script:LogBox.Lines = $tail
+                    $script:LogBox.SelectionStart = $script:LogBox.Text.Length
+                    $script:LogBox.ScrollToCaret()
+                }
             }
         } catch { }
     }
@@ -873,6 +915,7 @@ $miExit    = $menu.Items.Add('退出（服务保持运行）')
 # 服务控制点击：只启动后台任务，UI 线程立即返回（绝不在 UI 线程 Sleep/等网络）
 $miStart.add_Click({
     Log 'btn=menu-start click'
+    $script:ManualStop = $false   # 手动启动 = 用户要服务跑，恢复守护拉起
     $null = Start-BgTask 'srv' {
         param($port)
         try { Trace-Job 'work: first line (srv)' } catch { }
@@ -884,6 +927,7 @@ $miStart.add_Click({
 })
 $miStop.add_Click({
     Log 'btn=menu-stop click'
+    $script:ManualStop = $true    # 手动停止 = 用户意图优先，守护不得覆盖
     $null = Start-BgTask 'srv' {
         param($port)
         try { Trace-Job 'work: first line (srv)' } catch { }
@@ -894,6 +938,7 @@ $miStop.add_Click({
 })
 $miRestart.add_Click({
     Log 'btn=menu-restart click'
+    $script:ManualStop = $false   # 重启后服务应在运行
     $null = Start-BgTask 'srv' {
         param($port)
         try { Trace-Job 'work: first line (srv)' } catch { }
@@ -907,7 +952,7 @@ $miRestart.add_Click({
 })
 $miGuard.add_Click({
     $script:Guard = -not $script:Guard
-    if ($script:Guard) { $miGuard.Text = '暂停守护'; Log '守护已恢复' } else { $miGuard.Text = '恢复守护'; Log '守护已暂停' }
+    if ($script:Guard) { $miGuard.Text = '暂停守护'; $script:ManualStop = $false; Log '守护已恢复' } else { $miGuard.Text = '恢复守护'; Log '守护已暂停' }
     Refresh-State
 })
 $miEdStart.add_Click({
@@ -949,39 +994,28 @@ function Show-StatusWindow {
     if ($script:Form -eq $null) {
         $f = New-Object System.Windows.Forms.Form
         $f.Text            = 'Asset Bridge 状态'
-        $f.ClientSize      = New-Object System.Drawing.Size(560, 330)
+        $f.ClientSize      = New-Object System.Drawing.Size(600, 430)
         $f.StartPosition   = 'CenterScreen'
         $f.MinimizeBox     = $true
         $f.ShowInTaskbar   = $true
 
+        # 顶部状态条：服务器 连接/端口（秒级刷新，不阻塞）
         $script:StatusLabel = New-Object System.Windows.Forms.Label
-        $script:StatusLabel.SetBounds(14, 12, 530, 24)
+        $script:StatusLabel.SetBounds(14, 12, 560, 22)
         $script:StatusLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10)
         $f.Controls.Add($script:StatusLabel)
 
-        # 第二行：编辑器守护（PS/SAI2）状态
-        $script:EdLabel = New-Object System.Windows.Forms.Label
-        $script:EdLabel.SetBounds(14, 36, 530, 16)
-        $script:EdLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
-        $f.Controls.Add($script:EdLabel)
+        # ① 服务器开关
+        $h1 = New-Object System.Windows.Forms.Label
+        $h1.Text = '① 服务器'
+        $h1.SetBounds(14, 40, 200, 18)
+        $h1.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+        $f.Controls.Add($h1)
 
-        $script:LogBox = New-Object System.Windows.Forms.TextBox
-        $script:LogBox.SetBounds(14, 56, 530, 208)
-        $script:LogBox.Multiline   = $true
-        $script:LogBox.ReadOnly    = $true
-        $script:LogBox.WordWrap    = $true    # 日志自动换行
-        $script:LogBox.ScrollBars  = 'Vertical'
-        $script:LogBox.BackColor   = [System.Drawing.Color]::White
-        $script:LogBox.Font        = New-Object System.Drawing.Font('Consolas', 9)
-        $f.Controls.Add($script:LogBox)
-
-        # 窗口图标：标题栏 + 任务栏都设为 app_logo（任务栏小图标见 Set-FormIcon）
-        Set-FormIcon $f
-
-        # 按钮：左侧 16px 小图标 + 右侧文字（图标来自 assets\icons\png\16）
-        $b1 = New-AbButton $f '启动'       'act_start.png'    14  96
-        $b1.add_Click({
-            Log 'btn=window-start click'
+        $bOpen = New-AbButton $f '开'   'act_start.png'   14  96  58
+        $bOpen.add_Click({
+            Log 'btn=window-server-open click'
+            $script:ManualStop = $false
             $null = Start-BgTask 'srv' {
                 param($port)
                 try { Trace-Job 'work: first line (srv)' } catch { }
@@ -992,9 +1026,10 @@ function Show-StatusWindow {
             } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
         })
 
-        $b2 = New-AbButton $f '停止'       'act_stop.png'     118 96
-        $b2.add_Click({
-            Log 'btn=window-stop click'
+        $bClose = New-AbButton $f '关'  'act_stop.png'    120 96  58
+        $bClose.add_Click({
+            Log 'btn=window-server-stop click'
+            $script:ManualStop = $true
             $null = Start-BgTask 'srv' {
                 param($port)
                 try { Trace-Job 'work: first line (srv)' } catch { }
@@ -1004,9 +1039,10 @@ function Show-StatusWindow {
             } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 30
         })
 
-        $b3 = New-AbButton $f '重启'       'act_restart.png'  222 96
-        $b3.add_Click({
-            Log 'btn=window-restart click'
+        $bRestart = New-AbButton $f '重启' 'act_restart.png' 226 96 58
+        $bRestart.add_Click({
+            Log 'btn=window-server-restart click'
+            $script:ManualStop = $false
             $null = Start-BgTask 'srv' {
                 param($port)
                 try { Trace-Job 'work: first line (srv)' } catch { }
@@ -1019,11 +1055,73 @@ function Show-StatusWindow {
             } { param($d) if ($d.ok) { Refresh-State $d.r } } @($script:Port) 60
         })
 
-        $b4 = New-AbButton $f '设置...'    'act_settings.png' 326 96
-        $b4.add_Click({ Show-Settings })
+        # ② 编辑器守护（PS / SAI2 / ZBrush 贴图回传）开关 + 状态
+        $h2 = New-Object System.Windows.Forms.Label
+        $h2.Text = '② 编辑器守护'
+        $h2.SetBounds(14, 104, 200, 18)
+        $h2.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+        $f.Controls.Add($h2)
 
-        $b5 = New-AbButton $f '隐藏到托盘' 'state_paused.png'  430 124
-        $b5.add_Click({ $script:Form.Hide() })
+        $script:EdLabel = New-Object System.Windows.Forms.Label
+        # 独占一行（在「编辑器守护」按钮下方），整行宽度，绝不截断；
+        # AutoSize=$false + AutoEllipsis=$false：文本过长也不被裁成「行」字。
+        $script:EdLabel.SetBounds(14, 158, 560, 18)
+        $script:EdLabel.AutoSize = $false
+        $script:EdLabel.AutoEllipsis = $false
+        $script:EdLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+        $f.Controls.Add($script:EdLabel)
+
+        $bEdOpen = New-AbButton $f '开' 'act_start.png' 14 96 124
+        $bEdOpen.add_Click({
+            $null = Start-BgTask 'ed' { Start-EditorDaemon; Start-Sleep -Milliseconds 500; Get-StateData } `
+                { param($d) if ($d.ok) { Refresh-State $d.r } } 30
+        })
+
+        $bEdClose = New-AbButton $f '关' 'act_stop.png' 120 96 124
+        $bEdClose.add_Click({
+            $null = Start-BgTask 'ed' { Stop-EditorDaemon; Get-StateData } `
+                { param($d) if ($d.ok) { Refresh-State $d.r } } 30
+        })
+
+        # ③ 工具
+        $h3 = New-Object System.Windows.Forms.Label
+        $h3.Text = '③ 工具'
+        $h3.SetBounds(14, 184, 200, 18)
+        $h3.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
+        $f.Controls.Add($h3)
+
+        # ③ 工具行：4 个等宽按钮，x/w 严格算在 600 宽窗体内（避免 bHide 越界），y=204 在「③ 工具」标题下方不重叠
+        $bBridge = New-AbButton $f '桥设置'     'act_settings.png'  14  130 204
+        $bBridge.add_Click({ Show-Settings })
+
+        $bFlow = New-AbButton $f '流转设置'   'act_sync.png'       158 130 204
+        $bFlow.add_Click({ Show-FlowSettings })
+
+        $bInstall = New-AbButton $f '安装插件' 'act_folder.png'     302 130 204
+        $bInstall.add_Click({ Show-Installer })
+
+        $bHide = New-AbButton $f '隐藏到托盘' 'state_paused.png'    446 130 204
+        $bHide.add_Click({ $script:Form.Hide() })
+
+        # 日志框（已过滤 · 1Hz 刷新）：只显示业务关键事件，内部轮询噪声不进界面
+        $logHint = New-Object System.Windows.Forms.Label
+        $logHint.Text = '日志（已过滤 · 1Hz 刷新）'
+        $logHint.ForeColor = [System.Drawing.Color]::Gray
+        $logHint.SetBounds(14, 244, 560, 16)
+        $f.Controls.Add($logHint)
+
+        $script:LogBox = New-Object System.Windows.Forms.TextBox
+        $script:LogBox.SetBounds(14, 262, 560, 154)
+        $script:LogBox.Multiline   = $true
+        $script:LogBox.ReadOnly    = $true
+        $script:LogBox.WordWrap    = $true    # 日志自动换行
+        $script:LogBox.ScrollBars  = 'Vertical'
+        $script:LogBox.BackColor   = [System.Drawing.Color]::White
+        $script:LogBox.Font        = New-Object System.Drawing.Font('Consolas', 9)
+        $f.Controls.Add($script:LogBox)
+
+        # 窗口图标：标题栏 + 任务栏都设为 app_logo
+        Set-FormIcon $f
 
         # 关闭 = 缩回托盘；但「真正退出」时不能拦截，否则 Application.Exit() 会被取消
         $f.add_FormClosing({ param($sender, $e)
@@ -1036,6 +1134,226 @@ function Show-StatusWindow {
     Update-StatusWindow
     $script:Form.Show()
     $script:Form.Activate()
+}
+
+# ===========================================================================
+#  流转设置：逐路由 auto_open / auto_focus / format 覆盖（一对一，不做一对多）
+#  路由表 + 各 App 支持格式来自 shared/profiles.json（只读）；用户覆盖存 flow_settings.json。
+#  刻意不暴露 ZBrush 的 Roll=90 / 归一化等底层硬规则（已由适配器写死，避免误操作破坏已验证尺寸/朝向）。
+# ===========================================================================
+function Get-FlowSettings {
+    # 返回 [ordered]@{ "src>dst" = @{ auto_open; auto_focus; format; _kind; formats } }
+    $routes = [ordered]@{}
+    $prof = $null
+    if (Test-Path $PROFILES) {
+        try { $prof = Get-Content $PROFILES -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+    if ($prof -and $prof.routes) {
+        foreach ($p in $prof.routes.PSObject.Properties) {
+            $k   = $p.Name
+            $def = $p.Value
+            $src = ($k -split '>', 2)[0]
+            $fmt = if ($def.format) { [string]$def.format } else { 'obj' }
+            # 该路由源 App 支持的格式（来自 profiles.apps.<src>.formats），文本贴图路由固定 textures
+            $fmts = @()
+            try { $fmts = @($prof.apps.$src.formats) } catch { }
+            if ([string]$def.kind -eq 'textures') { $fmts = @('textures') + $fmts }
+            if ($fmts.Count -eq 0) { $fmts = @($fmt) }
+            $routes[$k] = [ordered]@{
+                auto_open  = $true
+                auto_focus = $false
+                format     = $fmt
+                _kind      = [string]$def.kind
+                formats    = $fmts
+            }
+        }
+    }
+    # 覆盖：flow_settings.json 中用户保存的逐路由设置
+    if (Test-Path $FLOWCFG) {
+        try {
+            $ov = Get-Content $FLOWCFG -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($ov.routes) {
+                foreach ($p in $ov.routes.PSObject.Properties) {
+                    $k = $p.Name
+                    if ($routes.Contains($k)) {
+                        if ($p.Value.PSObject.Properties.Name -contains 'auto_open')  { $routes[$k].auto_open  = [bool]$p.Value.auto_open }
+                        if ($p.Value.PSObject.Properties.Name -contains 'auto_focus') { $routes[$k].auto_focus = [bool]$p.Value.auto_focus }
+                        if ($p.Value.PSObject.Properties.Name -contains 'format')     { $routes[$k].format     = [string]$p.Value.format }
+                    }
+                }
+            }
+        } catch { }
+    }
+    return $routes
+}
+
+function Save-FlowSettings($routes) {
+    try {
+        if (-not (Test-Path $RUNTIME)) { New-Item -ItemType Directory -Path $RUNTIME -Force | Out-Null }
+        $out = [ordered]@{
+            version = 1
+            note    = '逐路由流转设置覆盖：auto_open/auto_focus/format。ZBrush 的 Roll=90/归一化由底层写死，不在此暴露。'
+            routes  = $routes
+        }
+        $json = $out | ConvertTo-Json -Depth 4
+        # 2026-10-26 P0-1：PowerShell 5.1 的 Out-File -Encoding utf8 会写 BOM（EF BB BF），
+        # 导致 Python 端 json.loads 抛「Unexpected UTF-8 BOM」-> 聚焦配置反复失效。
+        # 改用无 BOM 写入（与 L2258/L2303 既有写法一致）。
+        [System.IO.File]::WriteAllText($FLOWCFG, $json, (New-Object System.Text.UTF8Encoding($false)))
+        # 校验：重新读回字节，确认首字节是 7B（{）而非 BOM；异常时 UI 明确报错，不静默。
+        $bytes = [System.IO.File]::ReadAllBytes($FLOWCFG)
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            throw '保存后检测到 UTF-8 BOM（前 3 字节 EF BB BF），写入编码异常'
+        }
+        if ($bytes.Length -lt 1 -or $bytes[0] -ne 0x7B) {
+            throw ('保存后文件首字节非 JSON 起始（{），实际=0x{0:X2}' -f $bytes[0])
+        }
+        Log ('流转设置已保存 -> ' + $FLOWCFG)
+        [System.Windows.Forms.MessageBox]::Show('流转设置已保存', 'Asset Bridge') | Out-Null
+    } catch {
+        Log ('流转设置保存失败: ' + $_.Exception.Message)
+        [System.Windows.Forms.MessageBox]::Show(('保存失败：{0}' -f $_.Exception.Message), 'Asset Bridge') | Out-Null
+    }
+}
+
+function Show-FlowSettings {
+    $d = New-Object System.Windows.Forms.Form
+    $d.Text          = '流转设置'
+    $d.ClientSize    = New-Object System.Drawing.Size(560, 470)
+    # 2026-10-19：独立窗口（CenterScreen），不依赖 Owner / CenterParent
+    $d.StartPosition = 'CenterScreen'
+    $d.FormBorderStyle = 'FixedDialog'
+    $d.MaximizeBox   = $false
+    $d.MinimizeBox   = $false
+
+    $header = New-Object System.Windows.Forms.Label
+    $header.Text = '默认流转路由（一对一）：勾选自动打开/自动聚焦，选择格式。ZBrush 的 Roll=90/归一化由底层写死，不在此暴露。'
+    $header.SetBounds(12, 10, 536, 32)
+    $header.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $d.Controls.Add($header)
+
+    # 滚动容器：路由较多时整体滚动
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.SetBounds(12, 48, 536, 350)
+    $panel.AutoScroll = $true
+    $panel.BorderStyle = 'FixedSingle'
+    $d.Controls.Add($panel)
+
+    # 占位（异步加载期间显示），加载完由 Apply-FlowSettingsRows 清空并填真实行
+    $placeholder = New-Object System.Windows.Forms.Label
+    $placeholder.Text = '正在加载流转设置...'
+    $placeholder.SetBounds(6, 8, 400, 18)
+    $panel.Controls.Add($placeholder)
+
+    # 控件引用存脚本作用域，供后台回调跨线程回填（与安装器一致）
+    $script:FlowPanel       = $panel
+    $script:FlowPlaceholder = $placeholder
+
+    $bSave = New-Object System.Windows.Forms.Button;   $bSave.Text = '保存';        $bSave.SetBounds(12, 406, 100, 30)
+    $bReset = New-Object System.Windows.Forms.Button;  $bReset.Text = '重置默认';   $bReset.SetBounds(120, 406, 100, 30)
+    $bClose = New-Object System.Windows.Forms.Button;  $bClose.Text = '返回主面板'; $bClose.SetBounds(448, 406, 100, 30)
+    $d.Controls.Add($bSave); $d.Controls.Add($bReset); $d.Controls.Add($bClose)
+
+    $bClose.add_Click({ param($s, $e) $s.FindForm().Close() })
+    $bReset.add_Click({
+        try { if (Test-Path $FLOWCFG) { Remove-Item $FLOWCFG -Force } } catch { }
+        Log '流转设置已重置为默认（shared/profiles.json）'
+        # 清缓存，下次打开重新读默认
+        $script:FlowSettingsCache = $null
+        $d.Close()
+        Show-FlowSettings
+    })
+    $bSave.add_Click({
+        $out = [ordered]@{}
+        foreach ($rc in @($script:FlowRowCtrls)) {
+            $out[$rc.key] = [ordered]@{
+                auto_open  = [bool]$rc.open.Checked
+                auto_focus = [bool]$rc.focus.Checked
+                format     = [string]$rc.fmt.Text
+            }
+        }
+        Save-FlowSettings $out
+        $d.Close()
+    })
+
+    Set-FormIcon $d
+
+    # 2026-10-19 修复（卡 3-5 秒）：此前走 Start-BgTask 'flow' runspace，
+    # runspace 冷启动本身就要数百 ms~秒级；而 Get-FlowSettings 只读本机两个小 JSON
+    # （profiles.json + flow_settings.json，亚毫秒级），根本不值得异步。
+    # 改为 UI 线程同步读取：窗口已 Show 之后再填，JSON 读取 + 建 ~35 行控件总计 <200ms，
+    # 彻底消除转圈。缓存仅作二次打开的快捷跳过，不再依赖 runspace。
+    $d.add_Shown({
+        try {
+            $cached = $script:FlowSettingsCache
+            if ($cached -ne $null -and ((Get-Date).Ticks - $script:FlowSettingsCacheAt) -lt ([TimeSpan]::FromSeconds(30).Ticks)) {
+                Apply-FlowSettingsRows $script:FlowPanel $cached
+            } else {
+                $r = Get-FlowSettings
+                $script:FlowSettingsCache = $r
+                $script:FlowSettingsCacheAt = (Get-Date).Ticks
+                Apply-FlowSettingsRows $script:FlowPanel $r
+            }
+        } catch {
+            if ($script:FlowPlaceholder -ne $null) {
+                $script:FlowPlaceholder.Text = ('加载失败: ' + $_.Exception.Message)
+            }
+            Log ('Show-FlowSettings 同步加载失败: ' + $_.Exception.Message)
+        }
+    })
+
+    [void]$d.ShowDialog()
+}
+
+# 把路由行填入 $panel。先清空占位，再建表头 + 各路由行。
+# 整段用 SuspendLayout/ResumeLayout 包裹：一次性加 ~35 行控件时只做一次布局，
+# 避免逐控件重排导致的 UI 线程假死/闪烁（用户反馈的卡顿根因之一）。
+function Apply-FlowSettingsRows($panel, $routes) {
+    if ($panel -eq $null) { return }
+    try {
+        $panel.SuspendLayout()
+        $panel.Controls.Clear()
+        $ch1 = New-Object System.Windows.Forms.Label; $ch1.Text = '源 ─► 目标';      $ch1.SetBounds(6, 4, 180, 18); $panel.Controls.Add($ch1)
+        $ch2 = New-Object System.Windows.Forms.Label; $ch2.Text = '自动打开';        $ch2.SetBounds(196, 4, 80, 18);  $panel.Controls.Add($ch2)
+        $ch3 = New-Object System.Windows.Forms.Label; $ch3.Text = '自动聚焦';        $ch3.SetBounds(284, 4, 80, 18);  $panel.Controls.Add($ch3)
+        $ch4 = New-Object System.Windows.Forms.Label; $ch4.Text = '格式';            $ch4.SetBounds(372, 4, 140, 18); $panel.Controls.Add($ch4)
+
+        $y = 26
+        $rowCtrls = @()
+        foreach ($k in @($routes.Keys)) {
+            $src, $dst = $k -split '>', 2
+            $r = $routes[$k]
+
+            $lbl = New-Object System.Windows.Forms.Label
+            $lbl.Text = ('{0} ─► {1}' -f $src, $dst)
+            $lbl.SetBounds(6, ($y + 2), 180, 22)
+            $panel.Controls.Add($lbl)
+
+            $cbOpen = New-Object System.Windows.Forms.CheckBox
+            $cbOpen.Checked = [bool]$r.auto_open; $cbOpen.SetBounds(200, $y, 18, 22)
+            $panel.Controls.Add($cbOpen)
+
+            $cbFocus = New-Object System.Windows.Forms.CheckBox
+            $cbFocus.Checked = [bool]$r.auto_focus; $cbFocus.SetBounds(288, $y, 18, 22)
+            $panel.Controls.Add($cbFocus)
+
+            $cbFmt = New-Object System.Windows.Forms.ComboBox
+            $cbFmt.SetBounds(368, $y, 150, 22); $cbFmt.DropDownStyle = 'DropDownList'
+            foreach ($f in @($r.formats)) {
+                if ($f -and -not $cbFmt.Items.Contains($f)) { [void]$cbFmt.Items.Add($f) }
+            }
+            if ($cbFmt.Items.Contains($r.format)) { $cbFmt.SelectedItem = $r.format } elseif ($cbFmt.Items.Count -gt 0) { $cbFmt.SelectedIndex = 0 }
+            $panel.Controls.Add($cbFmt)
+
+            $rowCtrls += @{ key = $k; open = $cbOpen; focus = $cbFocus; fmt = $cbFmt }
+            $y += 26
+        }
+        if ($y -gt $panel.Height) { $panel.AutoScrollMinSize = New-Object System.Drawing.Size(0, ($y + 10)) }
+        $script:FlowRowCtrls = $rowCtrls
+        $panel.ResumeLayout($true)
+    } catch {
+        Log ('Apply-FlowSettingsRows 失败: ' + $_.Exception.Message)
+    }
 }
 
 # ---- 设置窗 ---------------------------------------------------------------
@@ -2421,6 +2739,8 @@ function Update-InstallerUI {
             if ($script:IStatus -ne $null) { $script:IStatus.Text = ('检测失败: ' + $d.err) }
             return
         }
+        # 落缓存：下次开面板先渲染旧数据，扫描放后台，绝不阻塞弹窗
+        $script:InstallerCache = @($d.r)
         Apply-InstallerUI -apps @($d.r)
     } @($script:ManualPaths) 180
 }
@@ -2492,10 +2812,17 @@ function Show-Installer {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Asset Bridge 插件安装器'
     $form.ClientSize = New-Object System.Drawing.Size(560, 648)   # 8 软件重排后的高度
-    $form.StartPosition = 'CenterParent'
+    # 2026-10-19 修复（点安装器 X 误关主面板）：安装器必须是**完全独立**的窗口，
+    # 绝不能设 Owner / 父子关系——一旦 Owner 指向主面板，Windows 的拥有关系会让
+    # 安装器的关闭行为波及主面板。改为 Owner=$null + CenterScreen，关闭只关自己。
+    $form.Owner = $null
+    $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
-    $form.add_FormClosed({ $script:InstallerForm = $null })
+    # 关闭只影响安装器自身：Cancel=$false 让其正常关闭；FormClosed 释放资源 + 清空引用。
+    # 全程不触碰 $script:Form（主面板），杜绝误关主面板。
+    $form.add_FormClosing({ param($s, $e) $e.Cancel = $false })
+    $form.add_FormClosed({ param($s, $e) try { $s.Dispose() } catch { } $script:InstallerForm = $null })
 
     $report = New-Object System.Windows.Forms.TextBox
     $report.SetBounds(14, 14, 532, 220)
@@ -2578,7 +2905,11 @@ function Show-Installer {
 
     $bClose = New-Object System.Windows.Forms.Button
     $bClose.Text = '关闭'; $bClose.SetBounds(232, 588, 96, 28)
-    $bClose.add_Click({ $form.Close() })
+    # 2026-10-19 修复（点安装面板下方「关闭」误关主面板）：PowerShell 事件 scriptblock
+    # 在点击时于事件作用域求值，$form 会向上解析到脚本作用域的 $script:Form（主面板），
+    # 而非 Show-Installer 的局部 $form。改用 $s.FindForm() 取按钮所属窗体——恒为安装器自身，
+    # 绝不波及主面板。
+    $bClose.add_Click({ param($s, $e) $s.FindForm().Close() })
     $form.Controls.Add($bClose)
 
     # 控件交给脚本作用域（事件回调触发时 Show-Installer 的局部变量已不可见）
@@ -2676,10 +3007,28 @@ function Show-Installer {
     }
 
     Set-FormIcon $form
-    # 非模态显示 + 异步检测：窗口立即可交互，检测期间不卡界面
-    Update-InstallerUI
+    # 先弹窗（绝不阻塞）：窗口立即可交互，下面的缓存渲染/后台扫描都不会卡住弹出。
     [void]$form.Show()
     $form.Activate()
+    # 缓存优先：有旧结果立刻画上，窗口不空白不转圈；没有则提示「首次检测中」。
+    if ($script:InstallerCache -and $script:InstallerCache.Count -gt 0) {
+        if ($script:IStatus -ne $null) { $script:IStatus.Text = '已显示上次检测结果，后台重新检测中...' }
+        try { Apply-InstallerUI -apps @($script:InstallerCache) } catch { }
+    } else {
+        if ($script:IStatus -ne $null) { $script:IStatus.Text = '首次检测中...（窗口可正常使用）' }
+    }
+    # 后台扫描（异步 Start-BgTask）延后 250ms 触发：确保窗口已绘制完成，即便首次冷启动
+    # PS 进程开销大，也绝不卡住弹窗。完成后经 onDone -> Apply-InstallerUI 更新 UI（Invoke）。
+    if ($script:InstallerScanTimer -ne $null) { try { $script:InstallerScanTimer.Stop() } catch { } }
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = 250
+    $t.add_Tick({
+        param($s, $e)
+        try { $s.Stop(); $s.Dispose() } catch { }
+        Update-InstallerUI
+    })
+    $script:InstallerScanTimer = $t
+    $t.Start()
 }
 
 # ---- 自检定时器 -----------------------------------------------------------

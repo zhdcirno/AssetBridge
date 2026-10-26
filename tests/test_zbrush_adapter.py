@@ -108,7 +108,7 @@ class TestInboxProtocol(unittest.TestCase):
             Path(os.path.join(inbox, "notes.txt")).write_text("x", encoding="utf-8")
             Path(os.path.join(inbox, "bad.json")).write_text('{"no_id": 1}', encoding="utf-8")
 
-            tasks = PLUGIN.scan_inbox(inbox)
+            tasks, _skipped = PLUGIN.scan_inbox(inbox)
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0][1]["transfer_id"], "t1")
 
@@ -123,8 +123,8 @@ class TestInboxProtocol(unittest.TestCase):
             self.assertTrue(PLUGIN.consume(rp))
 
     def test_scan_inbox_missing_dir(self):
-        self.assertEqual(PLUGIN.scan_inbox(""), [])
-        self.assertEqual(PLUGIN.scan_inbox("/nonexistent/xyz"), [])
+        self.assertEqual(PLUGIN.scan_inbox("")[0], [])
+        self.assertEqual(PLUGIN.scan_inbox("/nonexistent/xyz")[0], [])
 
 
 class TestTransferBody(unittest.TestCase):
@@ -265,6 +265,7 @@ class TestImportPending(unittest.TestCase):
             self.tool_after = tool_after
             self.dialog = dialog
             self.raise_on_press = raise_on_press
+            self._subtools = 0   # 建模当前工具子工具数（Import 首建 / Duplicate +1）
 
         def has_next_filename(self):
             return self.dialog
@@ -274,8 +275,16 @@ class TestImportPending(unittest.TestCase):
 
         def press(self, item):
             self.calls.append(("press", item))
+            if item == "Tool:SubTool:Duplicate":
+                self._subtools += 1
+            elif item == "Tool:Import":
+                if self._subtools == 0:
+                    self._subtools = 1
             if self.raise_on_press:
                 raise RuntimeError("native dialog blocked")
+
+        def get_subtool_count(self):
+            return self._subtools
 
         def get_active_tool_path(self):
             return self.tool_after
@@ -286,6 +295,12 @@ class TestImportPending(unittest.TestCase):
         def set_notebar_text(self, t, p=0.0):
             self.calls.append(("notebar", t))
 
+        def add_subpalette(self, *a, **k):
+            self.calls.append(("add_subpalette",) + a)
+
+        def add_button(self, *a, **k):
+            self.calls.append(("add_button",) + a)
+
     def setUp(self):
         self._orig_zbc = PLUGIN._zbc
         self.td = tempfile.mkdtemp()
@@ -295,9 +310,17 @@ class TestImportPending(unittest.TestCase):
         self.cfg.update({"payload_dir": self.td, "inbox_dir": self.inbox,
                          "outbox_dir": os.path.join(self.td, "zbrush_outbox"),
                          "import_wait_sec": 3.0})
+        # 各用例独立运行：清掉追加的全局运行态，避免用例间互相污染
+        # （autostart / start_watcher / auto_loop 会改这些字段）
+        PLUGIN._STATE["auto"] = False
+        PLUGIN._STATE["auto_thread"] = None
+        PLUGIN._STATE["watcher"] = False
 
     def tearDown(self):
         PLUGIN._zbc = self._orig_zbc
+        PLUGIN._STATE["auto"] = False
+        PLUGIN._STATE["auto_thread"] = None
+        PLUGIN._STATE["watcher"] = False
 
     def _task(self, tid="t1", files=("a.obj",)):
         for f in files:
@@ -314,31 +337,39 @@ class TestImportPending(unittest.TestCase):
         n = PLUGIN.import_pending(self.cfg)
         self.assertEqual(n, 1)
         self.assertIn(("press", "Tool:Import"), fake.calls)
-        rp = os.path.join(self.inbox, "t1.done.json")
+        # 2026-10-18 终局：回执与消费过的任务文件都归集到 inbox/done/，不在顶层堆积
+        rp = os.path.join(PLUGIN.done_dir(self.inbox), "t1.done.json")
         self.assertTrue(os.path.isfile(rp))
         receipt = json.loads(Path(rp).read_text(encoding="utf-8"))
         self.assertEqual(receipt["status"], "ok")
         self.assertEqual(receipt["imported"], ["a.obj"])
-        # 任务文件消费后即删
+        # 顶层不再残留历史垃圾（修复 ZBrush 扫描卡死的根因）
         self.assertFalse(os.path.isfile(os.path.join(self.inbox, "t1.json")))
+        self.assertFalse(os.path.isfile(os.path.join(self.inbox, "t1.done.json")))
+        # 消费过的任务文件进入 done/，可追溯
+        self.assertTrue(os.path.isfile(os.path.join(PLUGIN.done_dir(self.inbox), "t1.json")))
 
-    def test_dialog_suspected_skips_import(self):
+    def test_import_proceeds_without_dialog_prescreen(self):
+        """2026-10-16 用户实机纠正：has_next_filename() 常态 True（默认就有「下一个
+        文件名」），原「对话框挡路」预检会误杀全部导入（每次进来都是 True -> 永远 abort）。
+        现删除预检，改为直接调导入 API + 异常捕获：has_next_filename 为 True 时
+        也照常导入，不再因为常真值 abort。"""
         self._task()
-        fake = self.FakeZbc(dialog=True)
+        fake = self.FakeZbc(dialog=True)   # has_next_filename() -> True
         PLUGIN._zbc = lambda: fake
-        PLUGIN.import_pending(self.cfg)
-        # 有对话框风险 -> 不 press（绝不挂起主线程），回执记 error
-        self.assertNotIn(("press", "Tool:Import"), fake.calls)
-        receipt = json.loads(Path(os.path.join(self.inbox, "t1.done.json")).read_text(encoding="utf-8"))
-        self.assertEqual(receipt["status"], "error")
-        self.assertIn("对话框", receipt["error"])
+        n = PLUGIN.import_pending(self.cfg)
+        self.assertEqual(n, 1)
+        self.assertIn(("press", "Tool:Import"), fake.calls)   # 不再跳过
+        receipt = json.loads(Path(os.path.join(PLUGIN.done_dir(self.inbox), "t1.done.json")).read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "ok")
+        self.assertEqual(receipt["imported"], ["a.obj"])
 
     def test_press_exception_is_caught(self):
         self._task()
         fake = self.FakeZbc(raise_on_press=True)
         PLUGIN._zbc = lambda: fake
         PLUGIN.import_pending(self.cfg)   # 不能抛
-        receipt = json.loads(Path(os.path.join(self.inbox, "t1.done.json")).read_text(encoding="utf-8"))
+        receipt = json.loads(Path(os.path.join(PLUGIN.done_dir(self.inbox), "t1.done.json")).read_text(encoding="utf-8"))
         self.assertEqual(receipt["status"], "error")
 
     def test_import_wait_is_bounded(self):
@@ -392,6 +423,68 @@ class TestImportPending(unittest.TestCase):
         self.assertEqual(msg, "自动导入：正在停止…")
         self.assertFalse(PLUGIN._STATE["auto"])
 
+    def test_autostart_zero_block_and_watcher_p0_2(self):
+        """P0-2 复核：autostart 必须零阻塞返回（不拉后台 auto_loop 线程）。
+
+        后台线程调 zbc 在 ZBrush 真机无效（嵌入 VM 把 GIL 锁在主线程，
+        Maxon ZBrush 2026 Python SDK 明确 Main thread only），故 auto_loop
+        只在用户点「自动导入」按钮（主线程 toggle_auto）时运行。autostart
+        只建 UI + 起观察线程（纯 IO，不碰 zbc），立即返回；观察线程负责
+        心跳与 alive 判定。诊断日志打印插件心跳/状态目录三行（便于实机核对
+        alive=false 根因）。
+        """
+        fake = self.FakeZbc(tool_after="a")
+        PLUGIN._zbc = lambda: fake
+        # 写一份临时 ab_config.json（payload_dir 非空，心跳/状态目录可解析）
+        cfg_path = os.path.join(self.td, "ab_config.json")
+        Path(cfg_path).write_text(json.dumps({
+            "payload_dir": self.td,
+            "auto_max_sec": 3.0,
+            "poll_interval": 0.2,
+            "import_wait_sec": 1.0,
+        }), encoding="utf-8")
+        # 模拟全新启动：清掉全局 auto / auto_thread 状态
+        PLUGIN._STATE["auto"] = False
+        PLUGIN._STATE["auto_thread"] = None
+        t0 = time.time()
+        PLUGIN.autostart(cfg_path)               # 必须零阻塞立即返回
+        self.assertLess(time.time() - t0, 5.0,
+                        "autostart 不应阻塞 ZBrush 启动")
+        # 零阻塞 + 不在后台自动起 auto_loop：_STATE["auto"] 仍为 False
+        self.assertFalse(PLUGIN._STATE["auto"],
+                         "autostart 不应在后台自动起 auto_loop（非主线程调 zbc 无效）")
+        self.assertIsNone(PLUGIN._STATE["auto_thread"],
+                          "不应存在 auto_thread（后台循环线程已移除）")
+        # 观察线程（纯 IO）应在 autostart 内起：心跳文件出现
+        deadline = time.time() + 6
+        while time.time() < deadline and not os.path.isfile(
+                PLUGIN.heartbeat_path(self.cfg)):
+            time.sleep(0.2)
+        self.assertTrue(os.path.isfile(PLUGIN.heartbeat_path(self.cfg)),
+                        "观察线程未写出心跳（autostart 未起 watcher）")
+        # 诊断路径打印（P0-2 附赠）：payload_dir / heartbeat / status 三类齐全
+        dl = os.path.join(self.td, "zb_bridge_diag.log")
+        ddl = time.time() + 6
+        while time.time() < ddl and not os.path.isfile(dl):
+            time.sleep(0.1)
+        self.assertTrue(os.path.isfile(dl), "诊断日志未生成")
+        diag_txt = Path(dl).read_text(encoding="utf-8")
+        self.assertIn("autostart diag payload_dir={0}".format(self.td), diag_txt)
+        self.assertIn("autostart diag heartbeat={0}".format(
+            PLUGIN.heartbeat_path(self.cfg)), diag_txt)
+        self.assertIn("autostart diag status={0}".format(
+            PLUGIN.status_path(self.cfg)), diag_txt)
+        # 主线程兜底仍在：toggle_auto 是 auto_loop 的合法主线程入口（用极小
+        # auto_max_sec 让循环快速自停，避免阻塞测试；FakeZbc 不依赖真机）
+        self.cfg["auto_max_sec"] = 0.5
+        self.cfg["poll_interval"] = 0.1
+        msg = PLUGIN.toggle_auto(self.cfg)   # 主线程跑一轮后自动停
+        self.assertIn("自动导入：已停止", msg)
+        self.assertFalse(PLUGIN._STATE["auto"], "toggle_auto 结束后未复位 auto")
+        # 收尾：清 auto_thread 防污染后续用例
+        PLUGIN._STATE["auto"] = False
+        PLUGIN._STATE["auto_thread"] = None
+
 
 class TestModuleHygiene(unittest.TestCase):
     def test_plugin_has_no_zbrush_import_at_top(self):
@@ -414,6 +507,201 @@ class TestModuleHygiene(unittest.TestCase):
         self.assertIn("zbrush", DAEMON.DEFAULT_APPS)
         self.assertIn(".obj", DAEMON.MODEL_EXTS)
         self.assertTrue(DAEMON.ZB_ONE_SHOT.name == "one_shot_import.py")
+
+
+class TestExportPostProcess(unittest.TestCase):
+    """2026-10-17 修正（用户真机：ZBrush->UE 崩溃 / 模型极小）的纯几何验证。
+    不依赖 ZBrush 本体，直接验证 _postprocess_obj 的三角化 / UV 容错 / 缩放。"""
+
+    def _write_obj(self, path, text):
+        Path(path).write_text(text, encoding="utf-8")
+        return path
+
+    def _parse_faces(self, text):
+        faces = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("f "):
+                toks = s.split()[1:]
+                faces.append(toks)
+        return faces
+
+    def _count_vt(self, text):
+        return sum(1 for line in text.splitlines()
+                   if line.strip().startswith("vt "))
+
+    def _bbox_maxext(self, text):
+        verts = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("v "):
+                p = s.split()
+                verts.append((float(p[1]), float(p[2]), float(p[3])))
+        lo = [min(v[i] for v in verts) for i in range(3)]
+        hi = [max(v[i] for v in verts) for i in range(3)]
+        return max(hi[i] - lo[i] for i in range(3))
+
+    def test_triangulate_quad_and_uv_fix_and_normalize(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "m.obj")
+            # 极小模型（真机「几毫米」复现）：max extent=0.001；含一个 quad（带 UV）
+            # 与一个无 UV 的三角面（触发 UV 容错补齐）
+            obj = "\n".join([
+                "v 0.001 0 0", "v 0.001 0.001 0", "v 0.002 0.001 0",
+                "v 0.002 0 0",
+                "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1",
+                "f 1/1 2/2 3/3 4/4",
+                "v 0.001 0 0.001", "v 0.001 0.001 0.001", "v 0.002 0.001 0.001",
+                "f 5 6 7",
+            ]) + "\n"
+            self._write_obj(p, obj)
+
+            ok = PLUGIN._postprocess_obj(p, {"zbrush_export_scale": 1.0,
+                                             "zbrush_export_normalize_cm": 100.0})
+            self.assertTrue(ok, "postprocess 应成功")
+            out = Path(p).read_text(encoding="utf-8")
+
+            faces = self._parse_faces(out)
+            # 1 quad -> 2 三角 + 1 三角 = 3 个三角面
+            self.assertEqual(len(faces), 3, "quad 应被扇三角化为 2 个三角")
+            for f in faces:
+                self.assertEqual(len(f), 3, "每个面必须恰好 3 个顶点")
+                for tok in f:
+                    self.assertNotIn("//", tok, "不应残留无 UV 的 v//vn 写法")
+                    if "/" in tok:
+                        vi, vti = tok.split("/")
+                        self.assertTrue(int(vti) >= 1, "UV 索引必须 >=1")
+            # UV 容错：原本无 UV 的 face(5 6 7) 现在应有合法 vt 引用
+            self.assertIn("5/", faces[2][0], "无 UV 的 face 应被补齐合法 UV")
+            # 缩放归一化：max extent 应 ~100cm（归一化上限）
+            self.assertAlmostEqual(self._bbox_maxext(out), 100.0, delta=1.0)
+            # 所有 vt 引用都在范围内
+            nvt = self._count_vt(out)
+            for f in faces:
+                for tok in f:
+                    if "/" in tok:
+                        self.assertLessEqual(int(tok.split("/")[1]), nvt)
+
+    def test_sane_size_not_normalized(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "m.obj")
+            # 关闭归一化（normalize_cm=0）：原生尺寸应被原样保留（opt-out 路径）
+            obj = "\n".join([
+                "v -25 0 0", "v 25 0 0", "v 25 50 0", "v -25 50 0",
+                "vt 0 0", "vt 1 0", "vt 1 1", "vt 0 1",
+                "f 1/1 2/2 3/3 4/4",
+            ]) + "\n"
+            self._write_obj(p, obj)
+            PLUGIN._postprocess_obj(p, {"zbrush_export_scale": 1.0,
+                                        "zbrush_export_normalize_cm": 0.0})
+            out = Path(p).read_text(encoding="utf-8")
+            # 尺寸应保持 50（归一化关闭，不被改动）
+            self.assertAlmostEqual(self._bbox_maxext(out), 50.0, delta=0.5)
+
+    def test_small_model_normalized_to_cm(self):
+        # 2026-10-18 修复（用户真机：真实模型导出仅 2 单位，旧阈值 <1.0 漏判 -> 极小）：
+        # ZBrush 无量纲，应统一归一化到 zbrush_export_normalize_cm（默认 100cm）。
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "m.obj")
+            # 2 单位立方（真机真实尺寸），应被放大到 100cm
+            obj = "\n".join([
+                "v -1 -1 -1", "v 1 -1 -1", "v 1 1 -1", "v -1 1 -1",
+                "v -1 -1 1", "v 1 -1 1", "v 1 1 1", "v -1 1 1",
+                "f 1 2 3", "f 1 3 4", "f 5 6 7", "f 5 7 8",
+            ]) + "\n"
+            self._write_obj(p, obj)
+            PLUGIN._postprocess_obj(p, {"zbrush_export_scale": 1.0,
+                                        "zbrush_export_normalize_cm": 100.0})
+            out = Path(p).read_text(encoding="utf-8")
+            # 2 单位 -> 100cm（scale=50）
+            self.assertAlmostEqual(self._bbox_maxext(out), 100.0, delta=1.0)
+
+    def _parse_verts(self, text):
+        verts = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("v "):
+                p = s.split()
+                verts.append((float(p[1]), float(p[2]), float(p[3])))
+        return verts
+
+    def test_rotation_rx90_maps_y_up_to_z_up(self):
+        # 2026-10-17 修正（用户真机：ZBrush->UE 需手动 Roll=90 才正向）：
+        # 默认 zbrush_export_rotation={x:90} 应把 +Y 轴顶点转到 +Z（ZBrush Y-up -> UE Z-up）。
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "m.obj")
+            # 单三角：v1=(0,1,0) 指 +Y；关闭归一化/缩放以免干扰旋转判定
+            obj = "\n".join([
+                "v 0 1 0", "v 1 0 0", "v 0 0 0",
+                "f 1 2 3",
+            ]) + "\n"
+            self._write_obj(p, obj)
+            ok = PLUGIN._postprocess_obj(p, {
+                "zbrush_export_scale": 1.0,
+                "zbrush_export_normalize_cm": 0,
+                "zbrush_export_rotation": {"x": 90.0, "y": 0.0, "z": 0.0},
+            })
+            self.assertTrue(ok)
+            verts = self._parse_verts(Path(p).read_text(encoding="utf-8"))
+            # 原 (0,1,0) 经 Rx(+90) 应变为 (0,0,1)
+            self.assertAlmostEqual(verts[0][0], 0.0, places=5)
+            self.assertAlmostEqual(verts[0][1], 0.0, places=5)
+            self.assertAlmostEqual(verts[0][2], 1.0, places=5)
+
+    def test_rotation_disabled_leaves_verts_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "m.obj")
+            obj = "\n".join([
+                "v 0 1 0", "v 1 0 0", "v 0 0 0",
+                "f 1 2 3",
+            ]) + "\n"
+            self._write_obj(p, obj)
+            PLUGIN._postprocess_obj(p, {
+                "zbrush_export_scale": 1.0,
+                "zbrush_export_normalize_cm": 0,
+                "zbrush_export_rotation": {"x": 0.0, "y": 0.0, "z": 0.0},
+            })
+            verts = self._parse_verts(Path(p).read_text(encoding="utf-8"))
+            self.assertAlmostEqual(verts[0][1], 1.0, places=5)  # 未被旋转
+            self.assertAlmostEqual(verts[0][2], 0.0, places=5)
+
+    def test_send_current_clean_asset_name_not_path(self):
+        # 2026-10-17 修正（用户真机：回传名变成 payload 路径）：
+        # get_active_tool_path() 在 Windows 上返回反斜杠完整路径时，send_current
+        # 必须拿干净 basename（SM_Cube），而非整条路径。
+        captured = {}
+        captured_files = {}
+
+        def fake_export(obj, cfg=None):
+            Path(obj).write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+            return True, ""
+
+        def fake_publish(cfg, body, files, log=None):
+            captured["body"] = body
+            captured_files["files"] = list(files)
+            return True, "tid-xyz", "ok"
+
+        orig_export = PLUGIN.export_current
+        orig_publish = PLUGIN.publish_transfer
+        orig_tool = PLUGIN.current_tool_name
+        PLUGIN.export_current = fake_export
+        PLUGIN.publish_transfer = fake_publish
+        PLUGIN.current_tool_name = lambda: (
+            r"E:\CirnoWorkSpace\AssetBridge\runtime\payloads"
+            r"\9dda84d50ba9416d84f2fe68ddd81637\SM_Cube")
+        try:
+            cfg = {"server_url": "http://localhost:1", "default_to": "unreal",
+                   "payload_dir": tempfile.mkdtemp()}
+            ok, msg = PLUGIN.send_current(cfg, "unreal")
+            self.assertTrue(ok, msg)
+            self.assertEqual(captured["body"]["asset_name"], "SM_Cube")
+            self.assertTrue(captured_files["files"][0].endswith("SM_Cube.obj"),
+                            captured_files["files"])
+        finally:
+            PLUGIN.export_current = orig_export
+            PLUGIN.publish_transfer = orig_publish
+            PLUGIN.current_tool_name = orig_tool
 
 
 if __name__ == "__main__":
