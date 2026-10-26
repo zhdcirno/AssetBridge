@@ -26,3 +26,7 @@ venv/
 # ---- 操作系统 ----
 ehthumbs.db
 Desktop.ini
+
+# runtime artifacts
+plugins/zbrush/asset_bridge_zbrush/zb_bridge_diag.log
+tests/_repro_capture_run1/
