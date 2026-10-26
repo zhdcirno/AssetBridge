@@ -18,57 +18,57 @@ C:/Users/12069/.workbuddy/binaries/python/envs/default/Scripts/python.exe tools/
 
 ## 设计规范
 
-| 项 | 约定 |
-|---|---|
-| 画布 | 32×32 网格，**8 倍超采样**绘制后降采样 → 边缘干净无锯齿 |
-| 状态类 | **圆角方块** + 白色字形（与动作类统一；方块比圆在 16px 下更清晰、更有辨识度） |
-| 动作类 | 圆角方块（圆角 7.5）+ 白色字形 |
-| DCC 徽标 | 圆角方块 + 白色首字母 |
-| 风格 | 扁平、无渐变、无描边；保证 16px 下仍可辨识 |
+| 项      | 约定                                            |
+| ------ | --------------------------------------------- |
+| 画布     | 32×32 网格，**8 倍超采样**绘制后降采样 → 边缘干净无锯齿           |
+| 状态类    | **圆角方块** + 白色字形（与动作类统一；方块比圆在 16px 下更清晰、更有辨识度） |
+| 动作类    | 圆角方块（圆角 7.5）+ 白色字形                            |
+| DCC 徽标 | 圆角方块 + 白色首字母                                  |
+| 风格     | 扁平、无渐变、无描边；保证 16px 下仍可辨识                      |
 
 ## 图标清单（16 个）
 
 ### 状态类（托盘使用）
 
-| 文件 | 预览 | 含义 | 场景 |
-|---|---|---|---|
-| `state_running` | 🟢 绿方块 + ⇄ | 服务运行中 | 正常 |
-| `state_stopped` | 🔴 红方块 + ■ | 已停止（守护也暂停） | 你手动停了，且不会自动拉 |
+| 文件              | 预览          | 含义         | 场景               |
+| --------------- | ----------- | ---------- | ---------------- |
+| `state_running` | 🟢 绿方块 + ⇄  | 服务运行中      | 正常               |
+| `state_stopped` | 🔴 红方块 + ■  | 已停止（守护也暂停） | 你手动停了，且不会自动拉     |
 | `state_recover` | 🟠 琥珀方块 + ❗ | 掉线，守护会自动拉起 | 服务意外退出，10 秒内自动恢复 |
-| `state_paused` | ⚪ 灰方块 + ⏸ | 运行中但守护已暂停 | 你点了「暂停守护」 |
+| `state_paused`  | ⚪ 灰方块 + ⏸   | 运行中但守护已暂停  | 你点了「暂停守护」        |
 
-> 托盘实际映射：`运行中+守护开`→绿；`运行中+守护停`→灰；`已停止+守护开`→琥珀；`已停止+守护停`→红。
+> 托盘实际映射：`运行中+守护开`→绿；`运行中+守护停`→灰；`已停止+守护开`→琥珀；`已停止+守护停`→红。  
 > 悬停气泡会写明 `运行中 / 已停止` 与 `等待自动拉起`。
 
 ### 动作类
 
-| 文件 | 配色 | 含义 | 建议用途 |
-|---|---|---|---|
-| `act_start` | 绿 | 启动 | Maya shelf「启动」 |
-| `act_stop` | 红 | 停止 | Maya shelf「停止」 |
-| `act_restart` | 蓝 | 重启 / 刷新 | 重启服务 |
-| `act_send` | 青 | 发送（向上箭头 = 发出） | Blender/Maya/SP 的「发送」按钮 |
-| `act_receive` | 青 | 接收（向下箭头 = 收下） | 各软件的「接收」按钮 |
-| `act_sync` | 蓝 | 同步（上下互发） | 同步 `profiles.json` |
-| `act_settings` | 灰 | 设置（齿轮） | 偏好设置入口 |
-| `app_logo` | 石墨 | 应用主图标（⇄ 互发） | 文档封面 / 快捷方式 / 关于 |
+| 文件             | 配色 | 含义            | 建议用途                    |
+| -------------- | -- | ------------- | ----------------------- |
+| `act_start`    | 绿  | 启动            | Maya shelf「启动」          |
+| `act_stop`     | 红  | 停止            | Maya shelf「停止」          |
+| `act_restart`  | 蓝  | 重启 / 刷新       | 重启服务                    |
+| `act_send`     | 青  | 发送（向上箭头 = 发出） | Blender/Maya/SP 的「发送」按钮 |
+| `act_receive`  | 青  | 接收（向下箭头 = 收下） | 各软件的「接收」按钮              |
+| `act_sync`     | 蓝  | 同步（上下互发）      | 同步 `profiles.json`      |
+| `act_settings` | 灰  | 设置（齿轮）        | 偏好设置入口                  |
+| `app_logo`     | 石墨 | 应用主图标（⇄ 互发）   | 文档封面 / 快捷方式 / 关于        |
 
 ### DCC 徽标
 
-| 文件 | 配色 | 说明 |
-|---|---|---|
-| `dcc_blender` | 橙 `#FB923C` | Blender |
-| `dcc_unreal` | 石墨 `#2F384A` | Unreal Engine |
-| `dcc_maya` | 青 `#06B6D4` | Maya |
-| `dcc_painter` | 紫 `#8B5CF6` | Substance Painter |
+| 文件            | 配色           | 说明                |
+| ------------- | ------------ | ----------------- |
+| `dcc_blender` | 橙 `#FB923C`  | Blender           |
+| `dcc_unreal`  | 石墨 `#2F384A` | Unreal Engine     |
+| `dcc_maya`    | 青 `#06B6D4`  | Maya              |
+| `dcc_painter` | 紫 `#8B5CF6`  | Substance Painter |
 
 ## 已部署位置
 
-| 目标 | 文件 | 说明 |
-|---|---|---|
-| 托盘 | `tray\icon_ok.ico` / `icon_down.ico` / `icon_warn.ico` / `icon_paused.ico` | ← 分别来自 `state_running` / `state_stopped` / `state_recover` / `state_paused` |
-| Maya shelf | `C:\Users\12069\Documents\maya\2023\zh_CN\prefs\icons\assetbridge_start.png` / `assetbridge_stop.png` | ← `act_start` / `act_stop`（**文件名保持不变**，Maya shelf 无需改动） |
-| Maya shelf（备用） | 同目录下全套 `act_*.png` / `state_*.png` / `dcc_*.png` / `app_logo.png` | 给以后新增按钮用 |
+| 目标             | 文件                                                                                                    | 说明                                                                          |
+| -------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| 托盘             | `tray\icon_ok.ico` / `icon_down.ico` / `icon_warn.ico` / `icon_paused.ico`                            | ← 分别来自 `state_running` / `state_stopped` / `state_recover` / `state_paused` |
+| Maya shelf     | `C:\Users\12069\Documents\maya\2023\zh_CN\prefs\icons\assetbridge_start.png` / `assetbridge_stop.png` | ← `act_start` / `act_stop`（**文件名保持不变**，Maya shelf 无需改动）                     |
+| Maya shelf（备用） | 同目录下全套 `act_*.png` / `state_*.png` / `dcc_*.png` / `app_logo.png`                                     | 给以后新增按钮用                                                                    |
 
 ## 部署与维护（重要）
 
@@ -116,7 +116,7 @@ C = {
 
 ## 想加新图标？
 
-1. 在 `tools\gen_icons.py` 里写一个字形函数（坐标系是 32×32，用 `u()` 换算），
+1. 在 `tools\gen_icons.py` 里写一个字形函数（坐标系是 32×32，用 `u()` 换算），  
    例如：
    ```python
    def g_upload(d):

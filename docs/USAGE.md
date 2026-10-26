@@ -40,20 +40,18 @@
 
 ### 支持的能力
 
-| 能力       | 说明                                                                   |
-| -------- | -------------------------------------------------------------------- |
-| 模型收发     | 静态网格（SM\_）/ 骨骼网格（SK\_）在 Blender / UE / Maya / SP / **Toolbag** / **ZBrush** 间互发 |
-| 贴图回传     | Substance Painter 画好的 baseColor / normal / ORM 等发回 UE / Blender（kind=textures） |
-| 骨架收发     | FBX 自带骨骼层级，自动随模型过到 UE，不丢朝向                                           |
-| 增量更新     | 重复发送同名资产 = 覆盖更新（revision 递增），**不会**生成 `SM_Chair_1`                   |
-| 单位换算     | 米 / 厘米、Z-up / Y-up 自动处理，集中在 `shared/profiles.json`                   |
-| 材质槽 / UV | 材质槽、UV 集、顶点色随 FBX 一起走，UE 侧自动建材质                                      |
-| Toolbag 流转 | 其它软件发模型到八猴：选 **烘焙**（建烘焙组 + 设高低模）或 **渲染**（仅导入模型/材质）；八猴烘焙结果只回传 **SP** |
-| 编辑器流转   | 其它软件把**贴图**发到 **Photoshop / SAI2**，保存后**自动回传**并重载发送端资产（无 ps2other） |
+| 能力         | 说明                                                                              |
+| ---------- | ------------------------------------------------------------------------------- |
+| 模型收发       | 静态网格（SM\_）/ 骨骼网格（SK\_）在 Blender / UE / Maya / SP / **Toolbag** / **ZBrush** 间互发 |
+| 贴图回传       | Substance Painter 画好的 baseColor / normal / ORM 等发回 UE / Blender（kind=textures）  |
+| 骨架收发       | FBX 自带骨骼层级，自动随模型过到 UE，不丢朝向                                                      |
+| 增量更新       | 重复发送同名资产 = 覆盖更新（revision 递增），**不会**生成 `SM_Chair_1`                              |
+| 单位换算       | 米 / 厘米、Z-up / Y-up 自动处理，集中在 `shared/profiles.json`                              |
+| 材质槽 / UV   | 材质槽、UV 集、顶点色随 FBX 一起走，UE 侧自动建材质                                                 |
+| Toolbag 流转 | 其它软件发模型到八猴：选 **烘焙**（建烘焙组 + 设高低模）或 **渲染**（仅导入模型/材质）；八猴烘焙结果只回传 **SP**             |
+| 编辑器流转      | 其它软件把**贴图**发到 **Photoshop / SAI2**，保存后**自动回传**并重载发送端资产（无 ps2other）              |
 
 > ⚠️ **铁律：中转服务必须先启动，各软件都连它。** PS / SAI2 还需托盘里**启动编辑器守护进程**才能自动回传（见第 4.6 节）。任一软件没反应，第一步永远是先确认服务在跑（见第 5 节排查）。
-
-
 
 ---
 
@@ -316,6 +314,7 @@ abu.send_selected_assets("blender")
 - 方式 B（手动）：点工具栏 **「收模型」** 按钮。
 - 成功后 SP 日志：`[bridge] 已打开 SM_Cube（第 1 版）`。
 
+
 **回传贴图**：
 
 - 点工具栏 **「发贴图」** 按钮。
@@ -351,13 +350,13 @@ abu.send_selected_assets("blender")
 
 ### 3.7 ZBrush 2026.1+（模型收发）
 
-> 需要 **ZBrush 2026.1 或更高**（Python API 是 2026.0 才有的；2025.x 只有 ZScript，用不了）。
+> 需要 **ZBrush 2026.1 或更高**（Python API 是 2026.0 才有的；2025.x 只有 ZScript，用不了）。  
 > 2026.1 起 ZBrush 安装目录只读，插件装在**用户资产目录**（`%APPDATA%\Maxon\Zbrush<版本>_<哈希>\ZStartup\ZPlugs64\`）。
 
-**安装**：托盘 → 安装插件 → ZBrush 行点 **安装**。安装器会做三件事：拷插件到用户 ZStartup、写运行配置、往 `ZData\Python\init.py` 注入自动加载钩子。**重启 ZBrush** 后自动出现 `Zplugin → AssetBridge` 面板（观察线程已在后台运行，不会卡界面；待收任务数写在 `<中转目录>\bridge_status.json`）。
+**安装**：托盘 → 安装插件 → ZBrush 行点 **安装**。安装器会做三件事：拷插件到用户 ZStartup、写运行配置、往 `ZData\Python\init.py` 注入自动加载钩子。**重启 ZBrush** 后自动出现 `Zplugin → AssetBridge` 面板（观察线程已在后台运行，不会卡界面；待收任务数写在 `<中转目录>\bridge_status.json`）。  
 （万一 init.py 注入失败：ZScript 面板 → Python 子面板 → Load Script，选用户 ZStartup\ZPlugs64\asset_bridge_zbrush\asset_bridge_zbrush.py，效果一样。）
 
-**接收模型（其他软件 → ZBrush）——一键导入**：在 Blender / Maya / UE / SP / Toolbag 里把模型发往 **ZBrush**，然后在 ZBrush 里点 `Zplugin → AssetBridge → 导入待收模型`（主线程执行、免对话框、有超时保护，不会挂起）。
+**接收模型（其他软件 → ZBrush）——一键导入**：在 Blender / Maya / UE / SP / Toolbag 里把模型发往 **ZBrush**，然后在 ZBrush 里点 `Zplugin → AssetBridge → 导入待收模型`（主线程执行、免对话框、有超时保护，不会挂起）。  
 特殊情况：ZBrush 未运行时守护进程会自动拉起 ZBrush 一次性导入；ZBrush 开着但适配器没加载（比如没重启）时，模型会先落盘，托盘弹气泡告诉你文件路径（点气泡复制路径，或右键托盘「复制最近一次 ZBrush 接收路径」），然后在 ZBrush 里 `Tool → Load` 手动加载即可。
 
 **发送模型（ZBrush → 其他软件）——手动触发**：ZBrush 里选中要发的工具（SubTool），点 `Zplugin → AssetBridge → 发送当前模型`（默认发往 Blender；想发回最近一次给你发模型的软件，点「发送回最近发送者」）。导出免对话框，发完 note bar 有提示，对方软件自动导入/重载。
@@ -366,7 +365,7 @@ abu.send_selected_assets("blender")
 
 **自动导入（实验功能，默认关闭）**：点 `自动导入` 可开启主线程轮询导入——注意这会让 ZBrush 周期性卡顿（ZBrush 的 Python 只能在主线程干活，这是官方 API 的硬限制），随时再点一次停止，单圈超过 60 秒也会自动停。日常用「导入待收模型」按钮即可，无卡顿。
 
-> ⚠️ ZBrush **没有「保存后自动回传」**（没有保存事件钩子），发送一律是手动触发——按钮或热文件夹，二选一。
+> ⚠️ ZBrush **没有「保存后自动回传」**（没有保存事件钩子），发送一律是手动触发——按钮或热文件夹，二选一。  
 > ⚠️ 高模先 Decimation 再发，OBJ 动辄几百 MB。
 
 ---
@@ -384,16 +383,15 @@ abu.send_selected_assets("blender")
 | Blender → Maya（1m 立方体）              | 导入后为 **100cm**，往返无损 ✅                                         |
 | UE → Blender（旧 `global_scale=0.01`） | 缩小 100 倍 ❌（错误，已修正为 `1.0`）                                     |
 
-
 各路线缩放系数（都在 `shared/profiles.json` 里）：
 
-| 路线 | 缩放 |
-|---|---|
-| `blender>unreal`（导出） | `global_scale = 1.0` |
-| `unreal>blender`（导入） | `global_scale = 1.0`（**旧 0.01 错**） |
-| `blender>maya` | `global_scale = 1.0` |
-| `maya>unreal` / `unreal>maya` | `scale_factor = 1.0` |
-| `blender>substance_painter` | `global_scale = 1.0` |
+| 路线                            | 缩放                                 |
+| ----------------------------- | ---------------------------------- |
+| `blender>unreal`（导出）          | `global_scale = 1.0`               |
+| `unreal>blender`（导入）          | `global_scale = 1.0`（**旧 0.01 错**） |
+| `blender>maya`                | `global_scale = 1.0`               |
+| `maya>unreal` / `unreal>maya` | `scale_factor = 1.0`               |
+| `blender>substance_painter`   | `global_scale = 1.0`               |
 
 换轴：Blender / UE 都是 Z-up，无需换轴；Maya / SP 是 Y-up，Z↔Y 交给导入端处理。
 
@@ -458,6 +456,7 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
 ### 5.6 某软件「没反应」（收不到 / 发不出）
 
 按这个顺序查：
+
 1. **中转服务在跑吗？** 看 `start_bridge_server.bat` 窗口是否还开着，或浏览器开 `http://127.0.0.1:27631/api/v1/health` 是否返回 `{"ok": true, ...}`。
 2. **适配器启用 / 加载了吗？**
    - Blender：偏好设置里 `Asset Bridge (Blender)` 勾上了吗？
@@ -479,21 +478,21 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
 
 ### 5.8 「中转服务一退出，所有软件都卡」事故（本次已修）
 
-- **现象**：中转服务进程意外退出后——Blender 插件列表里找不到 Asset Bridge；
-  Maya 一直卡在启动界面；UE 打开测试关卡非常卡（延迟）；SP 变卡且日志疯狂刷
+- **现象**：中转服务进程意外退出后——Blender 插件列表里找不到 Asset Bridge；  
+  Maya 一直卡在启动界面；UE 打开测试关卡非常卡（延迟）；SP 变卡且日志疯狂刷  
   `[bridge] GET /inbox?... 失败: Error: HTTP 0`。
-- **根因**：四个适配器在服务不可达时**没有退避、没有熔断、且在主线程做同步阻塞
+- **根因**：四个适配器在服务不可达时**没有退避、没有熔断、且在主线程做同步阻塞  
   网络 IO**，把宿主软件全部拖死；其中 SP 还「注册失败永不重试」，服务恢复后也不上线。
 - **已修复**（2026-09-24）：
   - 所有网络 IO 移到**后台 daemon 线程**，主线程只做 DCC API 调用；
   - **指数退避** `min(1000·2^(n-1), 30000)ms` + **熔断**（连续失败 ≥5 次暂停并提示）
-    + **失败日志限频**（最多每 30s 一条）；
+    - **失败日志限频**（最多每 30s 一条）；
   - SP / Maya / UE 在拿到 session 前**不发 claim**、注册**按退避自动重试**；
   - 新增 `bridge_watchdog.ps1` 守护（见 2.1），`start_bridge_server.bat --watch` 进入守护模式。
 - **用户侧处置**：
   1. 先确认服务在跑（`start_bridge_server.bat` 窗口在 / 浏览器开 `http://127.0.0.1:27631/api/v1/health`）。
   2. 不在就双击启动；若怕再退出，用 `--watch` 守护模式。
-  3. 服务起来后 Maya / UE 通常**立即自愈**；SP 会自动重试注册上线（改了 `main.qml` 才需重启 SP）；
+  3. 服务起来后 Maya / UE 通常**立即自愈**；SP 会自动重试注册上线（改了 `main.qml` 才需重启 SP）；  
      Blender 若之前因装错目录而找不到，按 2.2 重新在正确目录启用即可。
 
 ### 5.9 ⚠️ 用户自备残留：`userSetup.py` 里的 `vaccine` / `leukocyte`（**只提示，不代改**）
@@ -507,34 +506,34 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
   ```
   而 `vaccine.py` 是个**空模块**，因此每次 Maya 启动执行到这几行都会抛 `AttributeError`。
 - **为什么要注意**：
-  1. `userSetup.py` 是 **Maya 启动即执行**的脚本。如果开头几行就抛异常，**后面追加的
-     Asset Bridge 自启动代码（`asset_bridge_maya.start()`）可能不会被执行** → 表现就是
-     「Maya 里 Asset Bridge 没反应」。此时可在 Maya 的 Script Editor 里手动执行
+  1. `userSetup.py` 是 **Maya 启动即执行**的脚本。如果开头几行就抛异常，**后面追加的  
+     Asset Bridge 自启动代码（`asset_bridge_maya.start()`）可能不会被执行** → 表现就是  
+     「Maya 里 Asset Bridge 没反应」。此时可在 Maya 的 Script Editor 里手动执行  
      `import asset_bridge_maya as abm; abm.start()` 兜底启动。
-  2. 这类 `vaccine.phage()` / `leukocyte.occupation()` 是**典型的 Maya 病毒（malware）残留特征**；
-     机器上还留有 `Documents/maya/2018/zh_CN/prefs/__pycache__/vaccine.cpython-39.pyc` 等痕迹，
+  2. 这类 `vaccine.phage()` / `leukocyte.occupation()` 是**典型的 Maya 病毒（malware）残留特征**；  
+     机器上还留有 `Documents/maya/2018/zh_CN/prefs/__pycache__/vaccine.cpython-39.pyc` 等痕迹，  
      说明这台机器历史上中过 Maya 脚本病毒。
-- **我们的立场**：这几行属于**用户自己的文件内容**，本工具**不擅自修改或删除**。
-  仅在此提示，请用户自行判断后清理（例如注释掉/删除该段，并扫描清除相关的
+- **我们的立场**：这几行属于**用户自己的文件内容**，本工具**不擅自修改或删除**。  
+  仅在此提示，请用户自行判断后清理（例如注释掉/删除该段，并扫描清除相关的  
   `vaccine.py` / `vaccine*.pyc` / `leukocyte*` 文件）。清理前建议自行备份。
 
 ### 5.10 托盘「停止服务」报「拒绝访问」（已修）
 
-- **现象**：托盘日志出现
-  `停止服务失败: 无法停止进程"python (50692)": 拒绝访问。`，紧接着
+- **现象**：托盘日志出现  
+  `停止服务失败: 无法停止进程"python (50692)": 拒绝访问。`，紧接着  
   `启动跳过：已在运行` —— 服务既停不掉、也换不成新进程。
-- **根因**：那个服务进程是**别的会话/终端**启动的（例如命令行直启、或由别的
-  后台任务拉起）。Windows 下 `Stop-Process` 跨会话拿不到 `PROCESS_TERMINATE`
-  权限（未提权且无 `SeDebugPrivilege`）→ 被拒绝；而端口还被占着，
+- **根因**：那个服务进程是**别的会话/终端**启动的（例如命令行直启、或由别的  
+  后台任务拉起）。Windows 下 `Stop-Process` 跨会话拿不到 `PROCESS_TERMINATE`  
+  权限（未提权且无 `SeDebugPrivilege`）→ 被拒绝；而端口还被占着，  
   `Start-Server` 又正确地拒绝重复启动。
-- **已修复**（2026-09-25）：服务新增 **`POST /api/v1/shutdown`** 优雅关闭接口，
+- **已修复**（2026-09-25）：服务新增 **`POST /api/v1/shutdown`** 优雅关闭接口，  
   托盘「停止服务」改为三步：
   1. 先 `POST /api/v1/shutdown`（**绕代理**，不需要任何进程权限，跨会话也有效）；
   2. 等它自己退出（最多 5 秒）；
   3. 仍活着才兜底 `Stop-Process`（同一会话由托盘拉起的服务一定能杀掉）。
-- **兜底**：万一仍停不掉，命令行执行 `taskkill /F /PID <pid>`（pid 见托盘状态窗
+- **兜底**：万一仍停不掉，命令行执行 `taskkill /F /PID <pid>`（pid 见托盘状态窗  
   或 `netstat -ano | findstr :27631`）；托盘看门狗会在 10 秒内把服务重新拉起。
-- **提示**：让托盘**自己**启动的服务是 `pythonw.exe`（`tray\run_server.py`），
+- **提示**：让托盘**自己**启动的服务是 `pythonw.exe`（`tray\run_server.py`），  
   与托盘进程解耦但同会话，因此「停止 / 重启」一定有效。
 
 ---
@@ -544,6 +543,7 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
 ### 6.1 新增一个软件适配器
 
 加一个新软件 = 加一个适配器，**其它代码不用动**（这是架构的核心收益）。套路：
+
 1. 在仓库下新建 `你的软件/plugin/asset_bridge_xxx/`，实现：
    - 注册会话（`POST /api/v1/sessions`）
    - 发送：导出 → `POST /transfers` → 落文件（`PUT /transfers/{id}/files/{name}` 或同机直写 payload 目录）→ `POST /transfers/{id}/publish`
@@ -561,16 +561,16 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py         # 一致性�
 
 ### 6.3 测试 / 自检脚本清单（`tests/`）
 
-| 脚本 | 用途 |
-|---|---|
-| `smoke_test.py` | 协议层冒烟测试（16 项） |
-| `profiles_sync.py` | 换算档案同步 + 一致性自检（带 `--sync`） |
-| `maya_stub_harness.py` | Maya 适配器逻辑测试（假 maya 模块 + 真服务，26 项） |
+| 脚本                           | 用途                                      |
+| ---------------------------- | --------------------------------------- |
+| `smoke_test.py`              | 协议层冒烟测试（16 项）                           |
+| `profiles_sync.py`           | 换算档案同步 + 一致性自检（带 `--sync`）              |
+| `maya_stub_harness.py`       | Maya 适配器逻辑测试（假 maya 模块 + 真服务，26 项）      |
 | `maya_commandport_verify.py` | Maya 实机 commandPort 验证（需先在 Maya 里启动适配器） |
-| `sp_qml_lint.py` | SP 插件 JS / QML 语法自检（重启 SP 前先跑） |
-| `sp_send_model.py` | 从 Blender 发模型给 SP（SP 自动开项目） |
-| `sp_to_ue_chain.py` | SP 烘焙 + 回传贴图 → UE 收入（一条命令跑完） |
-| `qa_*.py` | 全链路 QA 用例（Blender / UE / 贴图闭环等） |
+| `sp_qml_lint.py`             | SP 插件 JS / QML 语法自检（重启 SP 前先跑）          |
+| `sp_send_model.py`           | 从 Blender 发模型给 SP（SP 自动开项目）             |
+| `sp_to_ue_chain.py`          | SP 烘焙 + 回传贴图 → UE 收入（一条命令跑完）            |
+| `qa_*.py`                    | 全链路 QA 用例（Blender / UE / 贴图闭环等）         |
 
 跑协议层与档案自检：
 
@@ -583,9 +583,9 @@ python E:\CirnoWorkSpace\AssetBridge\tests\profiles_sync.py
 
 ## 附：各软件操作入口速查
 
-| 软件 | 发送入口 | 接收方式 | 启用动作 |
-|---|---|---|---|
-| Blender | 侧栏(N) → Asset Bridge →「发送选中对象」 | 自动（或「立即接收」） | 偏好设置勾选启用 ⚠️ |
-| Maya | Script Editor: `abm.send_selection(target_app=...)` | 自动（idle 轮询） | 重启 Maya ⚠️ |
-| Unreal | Output Log: `abu.send_selected_assets("blender")` | 自动（后台线程 + 摆进关卡） | 打开 AssetBridgeTest 工程即加载 |
-| Substance Painter | 工具栏「发贴图」 | 自动（或工具栏「收模型」） | 重启 SP ⚠️ |
+| 软件                | 发送入口                                                | 接收方式            | 启用动作                     |
+| ----------------- | --------------------------------------------------- | --------------- | ------------------------ |
+| Blender           | 侧栏(N) → Asset Bridge →「发送选中对象」                      | 自动（或「立即接收」）     | 偏好设置勾选启用 ⚠️              |
+| Maya              | Script Editor: `abm.send_selection(target_app=...)` | 自动（idle 轮询）     | 重启 Maya ⚠️               |
+| Unreal            | Output Log: `abu.send_selected_assets("blender")`   | 自动（后台线程 + 摆进关卡） | 打开 AssetBridgeTest 工程即加载 |
+| Substance Painter | 工具栏「发贴图」                                            | 自动（或工具栏「收模型」）   | 重启 SP ⚠️                 |
