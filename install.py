@@ -109,6 +109,10 @@ SP_DST = r"C:\Users\12069\Documents\Adobe\Adobe Substance 3D Painter\plugins\ass
 
 # Toolbag 5：复制插件到 <安装目录>\data\plugin\asset_bridge（__main__.py 自动加载）
 TOOLBAG_SRC = os.path.join(PROJECT_ROOT, "plugins", "toolbag", "asset_bridge")
+# ZBrush 2026+：复制插件到 %APPDATA%\Maxon\<ver>\ZStartup\ZPlugs64\asset_bridge_zbrush
+# （ZBrush 启动时扫描 ZPlugs64 自动加载；Python 插件需放此目录，与 ZData/Python
+# 的 init.py 钩子配合）。安装器写入 ab_config.json，路径对齐 daemon 的 runtime\payloads。
+ZBRUSH_SRC = os.path.join(PROJECT_ROOT, "plugins", "zbrush", "asset_bridge_zbrush")
 TOOLBAG_EXE_CANDIDATES = [
     r"D:\DCC\Toolbag 5\toolbag.exe",
     r"G:\DCC\Toolbag 5\toolbag.exe",
@@ -272,6 +276,10 @@ class Installer:
         self.changes.append(bat_path)
         self.log("OK", "生成启动脚本: " + bat_path)
 
+    # make_toolbag_bat 已移除（2026-10-16 用户纠正：Toolbag 5 自动扫描 Default
+    # Plugin Folder <安装目录>\data\plugin\，双击图标即加载，无需任何启动器 bat；
+    # 用户已确认磁盘上不存在该产物，纯代码清理）。
+
     def _cleanup_blender_mistakes(self):
         """清理历史错误安装，避免插件在列表里找不到 / 重复。
 
@@ -401,6 +409,77 @@ class Installer:
             return
         target = os.path.join(os.path.dirname(exe), "data", "plugin", "asset_bridge")
         self.safe_copy_dir(TOOLBAG_SRC, target)
+
+    @staticmethod
+    def _detect_zbrush_zstartup():
+        """扫描 %APPDATA%\\Maxon\\<ver>\\ZStartup\\ZPlugs64 作为插件部署目录。"""
+        maxon = os.path.join(os.environ.get("APPDATA", ""), "Maxon")
+        if not os.path.isdir(maxon):
+            return None
+        for name in sorted(os.listdir(maxon)):
+            cand = os.path.join(maxon, name, "ZStartup", "ZPlugs64")
+            if os.path.isdir(cand):
+                return cand
+        return None
+
+    def install_zbrush(self):
+        """部署 ZBrush 适配器到 ZStartup\\ZPlugs64\\asset_bridge_zbrush，并写入
+        ab_config.json（路径对齐 daemon 的 runtime\\payloads，统一为复数 payloads）。
+
+        根因修复（2026-10-16 P0）：此前 install.py 没有 ZBrush 步骤，插件 .py 从没被
+        同步到 ZStartup，用户只能手动改 ab_config.json（且改了 .py 也没更新，停在旧版）。
+        本步骤一次性解决「代码不部署 / 配置手动改 / 单复数路径错乱」三件事：
+          - 复制 plugins/zbrush/asset_bridge_zbrush 整个目录到 ZPlugs64；
+          - 写/合并 ab_config.json：payload_dir 用绝对路径指向本仓库 runtime\\payloads
+            （与 daemon 的 GET /config 返回的 payload_dir 一致，ZBrush inbox/outbox
+            才能和 daemon 对接），inbox_dir/outbox_dir 随之对齐；其余键保留用户/默认。
+        """
+        dst = self._detect_zbrush_zstartup()
+        if not dst:
+            self.log("SKIP", "未检测到 ZBrush ZStartup 目录（%APPDATA%\\Maxon\\*\\ZStartup\\"
+                             "ZPlugs64）。请先安装并运行一次 ZBrush 让目录生成，"
+                             "或手动指定 ZPlugs64 路径后重跑本安装器。")
+            return
+        target = os.path.join(dst, "asset_bridge_zbrush")
+        self.safe_copy_dir(ZBRUSH_SRC, target)
+        self._write_zbrush_config(target)
+
+    def _write_zbrush_config(self, plugin_dir):
+        """写/合并 ZBrush 插件的 ab_config.json。
+
+        路径类键（server_url/payload_dir/inbox_dir/outbox_dir）强制对齐本仓库的
+        runtime\\payloads（与 daemon 一致）；其余键（poll_interval/default_to/超时等）
+        若已存在则保留，避免覆盖用户自定义。绝对路径是因为插件装在 ZStartup，
+        无法用相对路径引用仓库 runtime。
+        """
+        payload = os.path.join(RUNTIME_ROOT, "payloads")
+        inbox = os.path.join(payload, "zbrush_inbox")
+        outbox = os.path.join(payload, "zbrush_outbox")
+        cfg_path = os.path.join(plugin_dir, "ab_config.json")
+        data = {}
+        if os.path.isfile(cfg_path):
+            try:
+                data = json.loads(self._read_file_text(cfg_path))
+            except Exception:
+                data = {}
+        data["server_url"] = data.get("server_url") or "http://127.0.0.1:27631"
+        data["payload_dir"] = payload
+        data["inbox_dir"] = inbox
+        data["outbox_dir"] = outbox
+        for k, v in {
+            "poll_interval": 2.0, "default_to": "blender",
+            "import_settle_sec": 1.0, "import_wait_sec": 15.0,
+            "upload_timeout": 300.0, "auto_max_sec": 1800.0,
+        }.items():
+            if k not in data:
+                data[k] = v
+        self._backup_if_exists(cfg_path)
+        if self.dry_run:
+            self.log("PLAN", "生成/更新 ZBrush 配置(路径对齐 runtime\\payloads): " + cfg_path)
+            return
+        self._write_text(cfg_path, json.dumps(data, indent=2, ensure_ascii=False))
+        self.changes.append(cfg_path)
+        self.log("OK", "已生成/更新 ZBrush 配置(路径对齐 runtime\\payloads): " + cfg_path)
 
     def sync_editor_daemon_config(self):
         """把检测到的 PS / SAI2 路径同步进 tools\\editor_daemon.json（守护进程读取）。
@@ -542,6 +621,7 @@ class Installer:
             ("Maya 适配器", self.install_maya),
             ("Substance Painter 适配器", self.install_substance_painter),
             ("Marmoset Toolbag 适配器", self.install_toolbag),
+            ("ZBrush 适配器", self.install_zbrush),
             ("Unreal 适配器", self.install_unreal),
             ("同步编辑器守护配置(PS/SAI2)", self.sync_editor_daemon_config),
             ("部署守护脚本(watchdog)", self.install_watchdog),
