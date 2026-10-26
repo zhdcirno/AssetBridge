@@ -166,27 +166,48 @@ def _refresh_ui():
         pass
 
 
+def _add_return(win):
+    """Toolbag UI 是流式布局：addReturn() 切到下一行，否则所有控件挤在一行
+    （表现为「Pull Now 左侧一大片空位」）。方法名在 Toolbag 5 文档里叫
+    addReturn；个别版本若没有则跳过（不阻断建面板）。"""
+    try:
+        fn = getattr(win, "addReturn", None)
+        if callable(fn):
+            fn()
+    except Exception:
+        pass
+
+
+def _pull_now():
+    """「Pull Now」按钮：先给即时反馈，再强制轮询一次（绕过时间闸门）。"""
+    _set_status("Pulling now…")
+    _poll_once(force=True)
+
+
 def _build_ui():
     try:
         win = mset.UIWindow("Asset Bridge (Toolbag)")
-        win.addElement(mset.UILabel("Asset Bridge 桥接适配器"))
+        win.addElement(mset.UILabel("Asset Bridge Adapter (Toolbag)"))
+        _add_return(win)
         status = mset.UITextField()
         status.value = _S.last_event
         win.addElement(status)
         _ui["status"] = status
+        _add_return(win)
 
-        pull_btn = mset.UIButton("立即接收")
-        pull_btn.onClick = lambda: _poll_once(force=True)
+        pull_btn = mset.UIButton("Pull Now")
+        pull_btn.onClick = lambda: _pull_now()
         win.addElement(pull_btn)
+        _add_return(win)
 
-        hide_btn = mset.UIButton("隐藏窗口（保留后台轮询）")
+        hide_btn = mset.UIButton("Hide (keep polling)")
         hide_btn.onClick = lambda: setattr(win, "visible", False)
         win.addElement(hide_btn)
 
         win.visible = True
         _ui["win"] = win
     except Exception as exc:
-        _log("UI 创建失败（不影响后台轮询）: {0}".format(exc))
+        _log("UI creation failed (polling continues): {0}".format(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +222,7 @@ def _register():
     })
     if r and r.get("session"):
         _S.session_id = r["session"]["session_id"]
-        _set_status("已注册会话 " + _S.session_id)
+        _set_status("session registered: " + _S.session_id)
         return True
     return False
 
@@ -254,11 +275,11 @@ def _on_poll_failure(what):
     now = time.time()
     if now - _S.last_fail_log_ts >= MAX_LOG_EVERY:
         _S.last_fail_log_ts = now
-        _log("中转服务通信失败({0}): {1}".format(_S.fail_streak, what))
+        _log("server comm failure({0}): {1}".format(_S.fail_streak, what))
     if _S.fail_streak >= 5 and not _S.circuit_open:
         _S.circuit_open = True
         _S.last_probe_ts = now
-        _set_status("中转服务不可达，已暂停轮询")
+        _set_status("server unreachable, polling paused")
 
 
 def _on_poll_success():
@@ -277,7 +298,7 @@ def _find_baker():
             if isinstance(obj, mset.BakerObject):
                 return obj
     except Exception as exc:
-        _log("遍历场景对象失败: {0}".format(exc))
+        _log("scene scan failed: {0}".format(exc))
     return None
 
 
@@ -290,10 +311,10 @@ def _get_baker(create=True):
         return None
     try:
         baker = mset.BakerObject()
-        _log("场景里没有 Baker，已新建 BakerObject")
+        _log("no Baker in scene, created one")
         return baker
     except Exception as exc:
-        _log("无法创建 BakerObject（{0}）：请在场景里手动添加一个 Bake 对象".format(exc))
+        _log("cannot create BakerObject ({0}): add a Bake object to the scene".format(exc))
         return None
 
 
@@ -330,7 +351,7 @@ def _configure_baker(baker, record, out_path):
     try:
         baker.outputPath = out_path
     except Exception as exc:
-        _log("设置 outputPath 失败: {0}".format(exc))
+        _log("set outputPath failed: {0}".format(exc))
     for attr, val in (("outputWidth", 2048), ("outputHeight", 2048),
                       ("outputBits", 8), ("outputSamples", 16)):
         try:
@@ -352,7 +373,7 @@ def _configure_baker(baker, record, out_path):
         if hit:
             enabled.append(hit)
         else:
-            _log("跳过不可用的贴图类型: {0}".format(entry))
+            _log("skipping unsupported map type: {0}".format(entry))
     return enabled
 
 
@@ -367,19 +388,19 @@ def _start_bake(record):
     models = _model_files(record)
     if not models:
         _finish(tid, "error", {"message": "没有随资产发来的模型文件（fbx/obj/usd/abc/ply/stl）"})
-        _set_status("烘焙失败：没有模型文件")
+        _set_status("bake failed: no model files")
         return False
 
     payload = _payload_dir()
     if not payload:
         _finish(tid, "error", {"message": "拿不到中转服务负载目录"})
-        _set_status("烘焙失败：拿不到负载目录")
+        _set_status("bake failed: no payload dir")
         return False
 
     baker = _get_baker(create=True)
     if baker is None:
         _finish(tid, "error", {"message": "场景里没有 Baker 且无法新建，请手动添加 Bake 对象后重试"})
-        _set_status("烘焙失败：没有 Baker")
+        _set_status("bake failed: no Baker")
         return False
 
     out_dir = os.path.join(payload, tid)
@@ -390,25 +411,46 @@ def _start_bake(record):
         _finish(tid, "error", {"message": "创建输出目录失败: {0}".format(exc)})
         return False
 
-    # 快速加载器导入模型（高低模由 Toolbag 自动归类）
+    # 导入模型：既要让网格进主场景（可见），也要登记进 Baker 作为烘焙输入。
+    # - mset.importModel 把网格加进主场景（render 模式同款调用，已验证可见）；
+    # - baker.importModel 走 Baker 快速加载器自动建高低模槽位。
+    # 两者任一成功即视为导入可用；render 模式只走 mset.importModel，烘焙模式
+    # 额外登记 Baker（2026-10-16 修复：原烘焙模式只调 baker.importModel 导致
+    # 网格未进主场景、用户看到「只建了 bake 组、模型没进来」）。
     imported = []
     for path in models:
+        ok_scene = False
         try:
-            baker.importModel(path)
-            imported.append(os.path.basename(path))
+            obj = mset.importModel(path)          # 进主场景（可见）
+            ok_scene = obj is not None
+            if ok_scene:
+                try:
+                    mset.frameObject(obj)
+                except Exception:
+                    pass
         except Exception as exc:
-            _log("导入模型失败 {0}: {1}".format(path, exc))
+            _log("scene model import failed {0}: {1}".format(path, exc))
+        ok_baker = False
+        try:
+            baker.importModel(path)              # 登记进 Baker 槽位
+            ok_baker = True
+        except Exception as exc:
+            _log("baker model import failed {0}: {1}".format(path, exc))
+        if ok_scene or ok_baker:
+            imported.append(os.path.basename(path))
+        else:
+            _log("both scene & baker import failed {0}".format(path))
     if not imported:
         _finish(tid, "error", {"message": "所有模型文件都导入失败"})
-        _set_status("烘焙失败：模型导入失败")
+        _set_status("bake failed: model import failed")
         return False
 
     # 建烘焙组（用户明确要求：烘焙模式要创建烘焙组）
     try:
         grp = baker.addGroup(name)
-        _log("已创建烘焙组: {0}".format(getattr(grp, "name", name)))
+        _log("bake group created: {0}".format(getattr(grp, "name", name)))
     except Exception as exc:
-        _log("创建烘焙组失败（继续烘焙）: {0}".format(exc))
+        _log("bake group failed (continuing): {0}".format(exc))
 
     out_path = os.path.join(out_dir, name + ".png")
     enabled_maps = _configure_baker(baker, record, out_path)
@@ -425,7 +467,7 @@ def _start_bake(record):
         "models": imported,
         "maps": enabled_maps,
     }
-    _set_status("开始烘焙 {0}（{1} 个模型，贴图: {2}）".format(
+    _set_status("baking {0} ({1} models, maps: {2})".format(
         name, len(imported), "/".join(enabled_maps) or "默认"))
     return True
 
@@ -456,13 +498,13 @@ def _advance_bake():
         except Exception as exc:
             _S.busy = False
             _finish(tid, "error", {"message": "bake() 失败: {0}".format(exc)})
-            _set_status("烘焙失败: {0}".format(exc))
+            _set_status("bake failed: {0}".format(exc))
             _S.job = None
             return
         _S.busy = False
         job["stage"] = "await"
         job["since"] = time.time()
-        _set_status("烘焙中… {0}".format(job["name"]))
+        _set_status("baking... {0}".format(job["name"]))
         return
 
     if job["stage"] == "await":
@@ -479,7 +521,7 @@ def _advance_bake():
         job["since"] = 0.0
         if now > job["deadline"]:
             _finish(tid, "error", {"message": "等待烘焙输出超时（{0:.0f}s）".format(BAKE_TIMEOUT_SEC)})
-            _set_status("烘焙超时")
+            _set_status("bake timed out")
             _S.job = None
         return
 
@@ -487,7 +529,7 @@ def _advance_bake():
 def _finish_bake(job, new_files):
     tid = job["tid"]
     out_dir = job["out_dir"]
-    _set_status("烘焙完成，正在回传 Substance Painter…")
+    _set_status("bake done, returning textures to SP...")
 
     # 回传一条 kind=textures 给 SP（SP 侧作为工程资源导入）
     target_app = "substance_painter"
@@ -512,7 +554,7 @@ def _finish_bake(job, new_files):
                     shutil.copy2(src, os.path.join(dest, fn))
             _safe("POST", "/transfers/{0}/publish".format(return_tid), {})
         except Exception as exc:
-            _log("回传贴图拷贝失败: {0}".format(exc))
+            _log("texture copy failed: {0}".format(exc))
             _safe("POST", "/transfers/{0}/finish".format(return_tid),
                   {"status": "error", "result": {"message": "拷贝失败: {0}".format(exc)}})
             return_tid = ""
@@ -523,13 +565,13 @@ def _finish_bake(job, new_files):
             "baked_files": new_files,
             "return_transfer": return_tid,
         })
-        _set_status("已回传 {0} 张贴图 -> SP".format(len(new_files)))
+        _set_status("returned {0} textures -> SP".format(len(new_files)))
     else:
         _finish(tid, "done", {
             "message": "烘焙完成（{0} 个文件），但回传 SP 失败，文件在负载目录".format(len(new_files)),
             "baked_files": new_files,
         })
-        _set_status("烘焙完成，回传 SP 失败")
+        _set_status("bake done, SP return failed")
     _S.job = None
 
 
@@ -543,7 +585,7 @@ def _handle_render(record):
     models = _model_files(record)
     if not models:
         _finish(tid, "error", {"message": "没有随资产发来的模型文件"})
-        _set_status("渲染模式失败：没有模型文件")
+        _set_status("render failed: no model files")
         return
     imported = []
     for path in models:
@@ -556,23 +598,23 @@ def _handle_render(record):
             except Exception:
                 pass
         except Exception as exc:
-            _log("导入模型失败 {0}: {1}".format(path, exc))
+            _log("model import failed {0}: {1}".format(path, exc))
     mats = _material_files(record)
     for path in mats:
         try:
             mset.importMaterial(path)
         except Exception as exc:
-            _log("导入材质失败 {0}: {1}".format(path, exc))
+            _log("material import failed {0}: {1}".format(path, exc))
     if not imported:
         _finish(tid, "error", {"message": "所有模型文件都导入失败"})
-        _set_status("渲染模式失败：导入失败")
+        _set_status("render failed: import failed")
         return
     _finish(tid, "done", {
         "message": "已导入 {0} 个模型{1}".format(
             len(imported), "、{0} 个材质".format(len(mats)) if mats else ""),
         "objects": imported,
     })
-    _set_status("已导入 {0}（渲染模式）".format(name))
+    _set_status("imported {0} (render mode)".format(name))
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +653,7 @@ def _poll_once(force=False):
             if _S.session_id:
                 _S.circuit_open = False
                 _S.fail_streak = 0
-                _set_status("中转服务已恢复")
+                _set_status("server back online")
             else:
                 return
 
@@ -625,7 +667,7 @@ def _poll_once(force=False):
 
     if not _S.session_id:
         if not _register():
-            _on_poll_failure("注册失败")
+            _on_poll_failure("register failed")
             return
 
     _S.poll_count += 1
@@ -634,7 +676,7 @@ def _poll_once(force=False):
 
     items = _inbox()
     if items is None:
-        _on_poll_failure("收件箱请求失败")
+        _on_poll_failure("inbox request failed")
         return
     _on_poll_success()
 
@@ -643,7 +685,7 @@ def _poll_once(force=False):
         if not full or not full.get("transfer"):
             continue
         record = full["transfer"]
-        _log("收到 {0}（来自 {1}，rev {2}，mode={3}）".format(
+        _log("received {0} (from {1}, rev {2}, mode={3})".format(
             record.get("asset_name"),
             (record.get("from") or {}).get("app", "?"),
             record.get("revision"),
@@ -653,7 +695,7 @@ def _poll_once(force=False):
         except Exception as exc:
             _finish(record["id"], "error",
                     {"message": "{0}: {1}".format(type(exc).__name__, exc)})
-            _set_status("处理失败: {0}".format(exc))
+            _set_status("handle failed: {0}".format(exc))
         break  # 一次只处理一条，剩下的下个轮询周期
 
 
@@ -662,7 +704,7 @@ def _on_periodic_update():
     try:
         _poll_once()
     except Exception as exc:
-        _log("轮询异常: {0}".format(exc))
+        _log("poll exception: {0}".format(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -674,20 +716,20 @@ def _install_callbacks():
         cbs = mset.callbacks
         cbs.onPeriodicUpdate = _on_periodic_update
         try:
-            cbs.onSceneLoaded = lambda: _set_status("场景已加载")
+            cbs.onSceneLoaded = lambda: _set_status("scene loaded")
         except Exception:
             pass
         return True
     except Exception as exc:
-        _log("注册 callbacks 失败: {0}".format(exc))
+        _log("callback registration failed: {0}".format(exc))
         return False
 
 
 _build_ui()
 if _install_callbacks():
-    _log("Toolbag 适配器已加载（服务 {0}）".format(SERVER_URL))
-    _set_status("适配器已加载，服务 " + SERVER_URL)
+    _log("Toolbag adapter loaded (server {0})".format(SERVER_URL))
+    _set_status("adapter loaded, server " + SERVER_URL)
     # 立即尝试注册一次，让面板状态尽快亮起来
     _register()
 else:
-    _set_status("回调注册失败，适配器未工作")
+    _set_status("callback registration failed, adapter inactive")
