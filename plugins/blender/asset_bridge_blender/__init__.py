@@ -63,6 +63,7 @@ class BridgeAddonPreferences(bpy.types.AddonPreferences):
             ("toolbag", "Marmoset Toolbag", "发送到 Toolbag（烘焙/渲染）"),
             ("photoshop", "Photoshop", "发送贴图到 PS，保存后自动重载"),
             ("sai2", "SAI2", "发送贴图到 SAI2，保存后自动重载"),
+            ("zbrush", "ZBrush", "发送到 ZBrush（模型，OBJ）"),
             ("blender", "Blender", "发给另一个 Blender 实例"),
         ],
         default="unreal",

@@ -220,6 +220,57 @@ def export_selection(filepath: str, profile: Dict, objects: List[bpy.types.Objec
     return filepath
 
 
+def export_obj(filepath: str, profile: Dict, objects: List[bpy.types.Object]) -> str:
+    """把选中对象导出为 OBJ（ZBrush 目标专用：ZBrush 免对话框只认 OBJ）。
+
+    只导网格（骨架/空物体对 ZBrush 无意义）；轴向用导出器默认值
+    （profiles.json 的 blender>zbrush 路由已注明轴向待实机校准）。
+    参数经 _call 的 RNA 反射过滤，跨 Blender 版本安全。
+    返回实际写出的文件路径。
+    """
+    import os
+
+    exp = dict(profile.get("export", {}))
+    scale = float(exp.get("global_scale", 1.0))
+
+    # 只导出目标对象：与 export_selection 相同的选中保存/恢复流程
+    prev_active = bpy.context.view_layer.objects.active
+    prev_sel = list(bpy.context.selected_objects)
+    bpy.ops.object.select_all(action="DESELECT")
+    meshes = [ob for ob in objects if ob.type == "MESH"]
+    for ob in meshes:
+        ob.select_set(True)
+    if meshes:
+        bpy.context.view_layer.objects.active = meshes[0]
+
+    try:
+        # use_selection（4.x+ 新名）/ export_selected_objects（旧名）：
+        # _call 会按 RNA 反射自动剔除当前版本不存在的参数名
+        _call(bpy.ops.wm.obj_export, {
+            "filepath": filepath,
+            "use_selection": True,
+            "export_selected_objects": True,
+            "global_scale": scale,
+            "export_materials": False,
+        })
+    finally:
+        bpy.ops.object.select_all(action="DESELECT")
+        for ob in prev_sel:
+            try:
+                ob.select_set(True)
+            except ReferenceError:
+                pass
+        if prev_active:
+            try:
+                bpy.context.view_layer.objects.active = prev_active
+            except ReferenceError:
+                pass
+
+    if not os.path.isfile(filepath):
+        raise RuntimeError(f"OBJ 导出未生成文件: {filepath}")
+    return filepath
+
+
 def export_to_payload_dir(payload_dir, asset_name: str, profile: Dict, objects) -> str:
     from pathlib import Path
 
@@ -264,6 +315,42 @@ def import_fbx(filepath: str, profile: Dict) -> List[bpy.types.Object]:
                 pass
 
     # 选中并聚焦，符合「发过来就能用」的预期
+    bpy.ops.object.select_all(action="DESELECT")
+    for ob in imported:
+        ob.select_set(True)
+    if imported:
+        bpy.context.view_layer.objects.active = imported[0]
+
+    return imported
+
+
+def import_obj(filepath: str, profile: Dict) -> List[bpy.types.Object]:
+    """导入 OBJ（ZBrush 回传/发送的模型都是 OBJ）。参数同样经 RNA 反射过滤。
+
+    放进当前场景 / 当前集合并选中的行为与 import_fbx 保持一致。
+    """
+    imp = dict(profile.get("import", {}))
+    kwargs = {
+        "filepath": filepath,
+        "global_scale": imp.get("global_scale", 1.0),
+    }
+
+    before = set(bpy.data.objects)
+    _call(bpy.ops.wm.obj_import, kwargs)
+    after = set(bpy.data.objects)
+
+    imported = [ob for ob in (after - before) if ob.name in bpy.data.objects]
+    imported.sort(key=lambda o: o.name)
+
+    scene = bpy.context.scene
+    target_col = bpy.context.view_layer.active_layer_collection.collection
+    for ob in imported:
+        if ob.name not in scene.objects:
+            try:
+                target_col.objects.link(ob)
+            except RuntimeError:
+                pass
+
     bpy.ops.object.select_all(action="DESELECT")
     for ob in imported:
         ob.select_set(True)

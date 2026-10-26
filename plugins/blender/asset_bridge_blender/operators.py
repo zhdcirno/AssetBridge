@@ -126,6 +126,9 @@ class BRIDGE_OT_send_selection(bpy.types.Operator):
 
         target = prefs.target_app
         profile = bridge_state.route_profile("blender", target)
+        # ZBrush 免对话框导入只认 OBJ -> 目标为 zbrush 时强制 OBJ 导出
+        to_zbrush = (target == "zbrush")
+        ext = "obj" if to_zbrush else "fbx"
 
         # 注意：bridge_asset_name 是注册在 Scene 上的 RNA 属性，不是 ID 自定义属性。
         # Blender 里 scene["x"] / scene.get("x") 只认 ID 自定义属性，取 RNA 属性会拿不到，
@@ -136,10 +139,14 @@ class BRIDGE_OT_send_selection(bpy.types.Operator):
             base = bridge_state.naming_rule(io_fbx.detect_kind(objects), base)
         asset_name = _clean_name(base)
 
+        kind = io_fbx.detect_kind(objects)
+        if to_zbrush:
+            kind = "models"  # ZBrush 第一期只收 models
+
         meta = {
             "asset_name": asset_name,
-            "kind": io_fbx.detect_kind(objects),
-            "format": profile.get("format", "fbx"),
+            "kind": kind,
+            "format": ext,
             "to": {
                 "app": target,
                 "project": prefs.project,
@@ -174,14 +181,18 @@ class BRIDGE_OT_send_selection(bpy.types.Operator):
             if payload_dir:
                 dst = Path(payload_dir) / tid
                 dst.mkdir(parents=True, exist_ok=True)
-                fbx = io_fbx.export_selection(
-                    str(dst / f"{asset_name}.fbx"), profile, objects
-                )
+                out_path = str(dst / f"{asset_name}.{ext}")
+                if to_zbrush:
+                    fbx = io_fbx.export_obj(out_path, profile, objects)
+                else:
+                    fbx = io_fbx.export_selection(out_path, profile, objects)
             else:
                 with tempfile.TemporaryDirectory() as tmp:
-                    fbx = io_fbx.export_selection(
-                        str(Path(tmp) / f"{asset_name}.fbx"), profile, objects
-                    )
+                    out_path = str(Path(tmp) / f"{asset_name}.{ext}")
+                    if to_zbrush:
+                        fbx = io_fbx.export_obj(out_path, profile, objects)
+                    else:
+                        fbx = io_fbx.export_selection(out_path, profile, objects)
                     client.put_file(tid, Path(fbx))
 
             rec = client.publish(tid)
@@ -412,7 +423,11 @@ def _import_model(full: dict) -> Tuple[str, dict]:
     profile = bridge_state.route_profile(src_app, "blender")
     imported = []
     for f in fbx_files:
-        imported += io_fbx.import_fbx(f, profile)
+        # ZBrush 发来的都是 OBJ；按扩展名选导入器（OBJ 走 FBX 导入器必炸）
+        if f.lower().endswith(".obj"):
+            imported += io_fbx.import_obj(f, profile)
+        else:
+            imported += io_fbx.import_fbx(f, profile)
     return "done", {
         "objects": [o.name for o in imported],
         "message": io_fbx.last_import_report(imported),

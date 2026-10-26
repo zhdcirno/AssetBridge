@@ -83,6 +83,8 @@ class BRIDGE_PT_panel(bpy.types.Panel):
                     box.label(text="烘焙：建烘焙组并烘焙，贴图回传 SP", icon="INFO")
                 else:
                     box.label(text="渲染：只导入模型/材质", icon="INFO")
+            if prefs.target_app == "zbrush":
+                box.label(text="ZBrush 只收模型（OBJ）；材质贴图不随行", icon="INFO")
             # 说明文字改为鼠标悬停提示（见 __init__.py 里属性的 description）
             box.prop(scene, "bridge_asset_name", text="资产名")
             box.prop(scene, "bridge_note", text="备注")
