@@ -1209,6 +1209,9 @@ function Save-FlowSettings($routes) {
             throw ('保存后文件首字节非 JSON 起始（{），实际=0x{0:X2}' -f $bytes[0])
         }
         Log ('流转设置已保存 -> ' + $FLOWCFG)
+        # 2026-10-27 修复：保存成功后立即清 30s 流转设置缓存，
+        # 否则 Shown 事件会在 30s 内命中旧缓存而显示旧值（「保存成功但重开回默认」）。
+        $script:FlowSettingsCache = $null
         [System.Windows.Forms.MessageBox]::Show('流转设置已保存', 'Asset Bridge') | Out-Null
     } catch {
         Log ('流转设置保存失败: ' + $_.Exception.Message)
