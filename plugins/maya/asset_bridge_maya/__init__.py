@@ -221,6 +221,13 @@ def _safe_version():
         return ""
 
 
+def _post_transfer(meta):
+    """发送前统一注入 from.app/version，修复服务端回传阶段报「发送端未标注 from.app」。"""
+    meta.setdefault("from", {})
+    meta["from"].update({"app": "maya", "version": _safe_version()})
+    return _req("POST", "/transfers", meta)["transfer"]
+
+
 def register():
     global _session_id
     v = _safe_version()
@@ -531,7 +538,7 @@ def send_groom(target_app="unreal", note=""):
         "objects": [{"name": r.split("|")[-1], "type": cmds.nodeType(r)} for r in roots],
         "note": note,
     }
-    rec = _req("POST", "/transfers", meta)["transfer"]
+    rec = _post_transfer(meta)
     tid = rec["id"]
     # 服务端可能把中文名归一化成了拼音，以它为准
     name = rec.get("asset_name") or name
@@ -645,7 +652,7 @@ def send_selection(target_app="unreal", note="", mode="update"):
         "objects": [{"name": s.split("|")[-1], "type": cmds.nodeType(s)} for s in sel],
         "note": note,
     }
-    rec = _req("POST", "/transfers", meta)["transfer"]
+    rec = _post_transfer(meta)
     tid = rec["id"]
     # 服务端可能把中文名归一化成了拼音，以它为准，保证文件名与记录名一致
     name = rec.get("asset_name") or name
@@ -769,7 +776,7 @@ def send_textures(target_app="photoshop", note=""):
         "objects": [{"name": n, "type": "file"} for n, _ in items],
         "note": note,
     }
-    rec = _req("POST", "/transfers", meta)["transfer"]
+    rec = _post_transfer(meta)
     tid = rec["id"]
     name = rec.get("asset_name") or name
 
