@@ -688,3 +688,9 @@ e. **flow_settings 读取频率**：已加 mtime 缓存（未变不重读），�
 2. 重启 **daemon**（托盘「编辑器守护」Stop→Start，或写 `stop.flag` 后 `pythonw -u tools/editor_daemon.py`）。
 3. **ZBrush** 加载新插件：`python install.py`（或 `install_zbrush`）一键复制插件到 ZStartup + 自动写 `ab_config.json`（`payload_dir` 对齐 `runtime\payloads`）；重启 ZBrush 使插件生效。
 4. 验证：UE→ZBrush 导入可用、PS/SAI2 聚焦正常、关闭编辑器后 watch 自动移除、带 BOM 的 inbox json 可正常扫描导入。
+
+## 已知限制（v2.1 封版后补充，2026-10-27）
+
+- **Toolbag（3e76d20）**：烘焙模型已导入主场景、Baker 组已创建，但模型**不会自动加入组**，需手动拖入/关联。commit message 中“同时进 Baker 槽位”仅指组创建，不含自动入组。列为 v2.2 工作项。
+- **ZBrush 接收**：默认手动触发（点「导入待收模型」），自动轮询导入为实验功能，默认关闭。13:10:44 那次接收为手动触发，符合 v2.1 设计，非缺陷。
+- **Toolbag bake 失败（seq 388）**：bake() 失败: Bake failed - check output path，属输出路径未配置，非适配器缺陷。
